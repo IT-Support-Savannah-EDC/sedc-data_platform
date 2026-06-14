@@ -7,11 +7,11 @@ from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import DBAPIError, OperationalError
 from pyodk.client import Client
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # 1. Setup Environment and Configurations
 load_dotenv("/opt/data_platform/config/.env")
-TARGET_SCHEMA = "data_raw"
+TARGET_SCHEMA = "data_raw"  # Updated per consolidated schema requirement
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -43,14 +43,14 @@ def validate_config():
 env_data = validate_config()
 PROJECT_ID = env_data["PROJECT_ID"]
 engine = create_engine(env_data["DATABASE_URL"], pool_pre_ping=True)
-client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
+client = Client(config_path="/opt/data_platform/config/pyodk_config.toml")
 
 # 2. Resilience Retry Decorators
 retry_api = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60), reraise=True)
 retry_db = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=50),
                   retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
 
-# 3. Dynamic Schema Evolution (Schema-Aware)
+# 3. Dynamic Schema Evolution
 @retry_db
 def sync_schema(df, table_name):
     if df.empty: return
@@ -68,45 +68,55 @@ def sync_schema(df, table_name):
             for col in new_cols:
                 transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
 
-# 4. Smart Master Clock (Prevents Duplicate 156k Row Downloads)
+# 4. Bi-Schema Aware Master Clock
 def get_smart_master_clock(dataset_name):
     """
-    Defensively checks for table existence using SQLAlchemy Inspector.
-    Prevents UndefinedTable exceptions from bypassing the refined data fallback.
+    Scans both data_raw and data_refined schemas for historical milestones.
+    If no tables exist in either location, safely returns None to trigger a full fetch.
     """
-    raw_table = f"entity_{dataset_name.replace(' ', '_').lower()}"
-    inspector = inspect(engine)
+    # Normalize name mapping: Sync central 'Customers_DB' directly with warehouse 'customer_db'
+    base_name = dataset_name.replace(' ', '_').lower()
+    if base_name == "customers_db":
+        base_name = "customer_db"
+        
+    raw_table = f"entity_{base_name}"
+    refined_table = base_name
     
-    # 1. Safely check if the Raw Table exists in data_raw_odk
+    inspector = inspect(engine)
+    found_milestones = []
+    
+    # 1. Inspect the Raw Schema
     if inspector.has_table(raw_table, schema=TARGET_SCHEMA):
         try:
             raw_query = text(f'SELECT MAX(GREATEST("__system_createdAt", COALESCE("__system_updatedAt", "__system_createdAt"))) FROM "{TARGET_SCHEMA}"."{raw_table}";')
             with engine.connect() as conn:
-                result = conn.execute(raw_query).scalar()
-                if result:
-                    return pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                res = conn.execute(raw_query).scalar()
+                if res:
+                    found_milestones.append(pd.Timestamp(res))
         except Exception as e:
-            logger.warning(f"⚠️ Could not parse raw master clock for {raw_table}: {e}")
-    else:
-        logger.info(f"ℹ️ Raw table {TARGET_SCHEMA}.{raw_table} does not exist yet. Checking Refined schema fallback...")
+            logger.warning(f"⚠️ Could not read clock from {TARGET_SCHEMA}.{raw_table}: {e}")
+            
+    # 2. Inspect the Refined Schema
+    if inspector.has_table(refined_table, schema="data_refined"):
+        try:
+            refined_query = text(f'SELECT MAX(GREATEST("__createdat", COALESCE("__updatedat", "__createdat"))) FROM "data_refined"."{refined_table}";')
+            with engine.connect() as conn:
+                res = conn.execute(refined_query).scalar()
+                if res:
+                    found_milestones.append(pd.Timestamp(res))
+        except Exception as e:
+            logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
 
-    # 2. Fallback: If it's the Customers_DB dataset, reference the manual 156k seed table
-    if dataset_name.lower() in ["customers_db", "customers", "customer_db"]:
-        if inspector.has_table("customer_db", schema="data_refined"):
-            try:
-                refined_query = text('SELECT MAX(GREATEST("__createdat", COALESCE("__updatedat", "__createdat"))) FROM data_refined.customer_db;')
-                with engine.connect() as conn:
-                    result = conn.execute(refined_query).scalar()
-                    if result:
-                        ts = pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                        logger.info(f"🎯 Milestone Match! Anchoring OData filter to Refined Baseline: {ts}")
-                        return ts
-            except Exception as e:
-                logger.warning(f"⚠️ Refined fallback lookup failed: {e}")
-        else:
-            logger.warning("⚠️ High-priority check failed: data_refined.customer_db table not found.")        
+    # 3. Decision Engine
+    if found_milestones:
+        max_milestone = max(found_milestones)
+        ts_str = max_milestone.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        logger.info(f"🎯 Milestone Found! Syncing updates newer than: {ts_str}")
+        return ts_str
+        
+    logger.info(f"ℹ️ No baseline discovered in {TARGET_SCHEMA} or data_refined for '{dataset_name}'. Preparing full historical fetch.")
     return None
-    
+
 # 5. ODK API Integration Functions
 @retry_api
 def discover_datasets(project_id):
@@ -120,12 +130,11 @@ def fetch_entities(project_id, dataset_name, params=None):
     response.raise_for_status()
     return response.json()
 
-# 6. High-Performance Schema-Isolated Upsert Engine
+# 6. Schema-Isolated Upsert Engine
 def upsert_raw_data(df, table_name, conflict_key="__id"):
     if df.empty: return 0
     staging_table = f"temp_{table_name}_{int(time.time())}"
     
-    # Structural step: Ensure target schema table exists before altering or inserting
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
     sync_schema(df, table_name)
     
@@ -153,8 +162,13 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
             cleanup_conn.commit()
 
 def sync_dataset_raw(dataset_name, project_id, dry_run=False):
-    logger.info(f"🧬 --- Extracting Raw Entities for Dataset: {dataset_name} ---")
-    db_table_name = f"{dataset_name.replace(' ', '_').lower()}"
+    # Standardize table naming metrics internally
+    base_name = dataset_name.replace(' ', '_').lower()
+    if base_name == "customers_db":
+        base_name = "customer_db"
+    db_table_name = f"entity_{base_name}"
+    
+    logger.info(f"🧬 --- Processing Ingestion for Dataset: {dataset_name} ---")
     
     last_update_time = get_smart_master_clock(dataset_name)
     api_params = {}
@@ -163,28 +177,26 @@ def sync_dataset_raw(dataset_name, project_id, dry_run=False):
     
     entities_response = fetch_entities(project_id, dataset_name, params=api_params)
     if not entities_response or 'value' not in entities_response or not entities_response['value']:
-        logger.info(f"⏸️ No delta updates found for dataset '{dataset_name}'. Schema is up to date.")
+        logger.info(f"⏸️ No delta updates found for '{dataset_name}'. Schema matches baseline.")
         return
 
     df = pd.json_normalize(entities_response['value'], sep='_')
-    logger.info(f"📡 API retrieved {len(df)} new/modified records.")
+    logger.info(f"📡 API retrieved {len(df)} records.")
 
     if dry_run:
-        logger.info(f"🧪 [DRY RUN SUCCESS]: Data verified. Column count: {len(df.columns)}. Rows found: {len(df)}")
-        print(df.head(2))
+        logger.info(f"🧪 [DRY RUN SUCCESS]: Data verified for {db_table_name}. Columns: {len(df.columns)}. Rows: {len(df)}")
         return
 
     count = upsert_raw_data(df, db_table_name, conflict_key="__id")
     logger.info(f"✅ Successfully written {count} records into {TARGET_SCHEMA}.{db_table_name}")
 
 if __name__ == "__main__":
-    # Test with DRY_RUN = True first to verify credentials and clock logic safely
     DRY_RUN_TOGGLE = True 
     
-    logger.info("🎬 Initializing Modular ODK Raw Extractor Test...")
+    logger.info("🎬 Initializing Adjusted ODK Raw Extractor Engine...")
     try:
         datasets = discover_datasets(PROJECT_ID)
         for dataset in datasets:
             sync_dataset_raw(dataset, PROJECT_ID, dry_run=DRY_RUN_TOGGLE)
     except Exception as e:
-        logger.critical(f"💥 Testing phase aborted due to error: {e}", exc_info=True)
+        logger.critical(f"💥 Ingestion engine halted: {e}", exc_info=True)
