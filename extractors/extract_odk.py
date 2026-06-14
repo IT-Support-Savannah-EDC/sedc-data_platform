@@ -154,7 +154,7 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
 
 def sync_dataset_raw(dataset_name, project_id, dry_run=False):
     logger.info(f"🧬 --- Extracting Raw Entities for Dataset: {dataset_name} ---")
-    db_table_name = f"entity_{dataset_name.replace(' ', '_').lower()}"
+    db_table_name = f"{dataset_name.replace(' ', '_').lower()}"
     
     last_update_time = get_smart_master_clock(dataset_name)
     api_params = {}
