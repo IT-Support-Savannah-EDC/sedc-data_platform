@@ -70,28 +70,43 @@ def sync_schema(df, table_name):
 
 # 4. Smart Master Clock (Prevents Duplicate 156k Row Downloads)
 def get_smart_master_clock(dataset_name):
+    """
+    Defensively checks for table existence using SQLAlchemy Inspector.
+    Prevents UndefinedTable exceptions from bypassing the refined data fallback.
+    """
     raw_table = f"entity_{dataset_name.replace(' ', '_').lower()}"
-    raw_query = text(f'SELECT MAX(GREATEST("__system_createdAt", COALESCE("__system_updatedAt", "__system_createdAt"))) FROM "{TARGET_SCHEMA}"."{raw_table}";')
-    refined_query = text('SELECT MAX(GREATEST("__createdat", COALESCE("__updatedat", "__createdat"))) FROM data_refined.customer_db;')
-
-    with engine.connect() as conn:
+    inspector = inspect(engine)
+    
+    # 1. Safely check if the Raw Table exists in data_raw_odk
+    if inspector.has_table(raw_table, schema=TARGET_SCHEMA):
         try:
-            # First check if raw table has data
-            result = conn.execute(raw_query).scalar()
-            if result:
-                return pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-            
-            # If raw is completely empty, look at our manual 156k seed table to pick up where we left off
-            logger.info(f"ℹ️ {TARGET_SCHEMA}.{raw_table} is empty. Checking data_refined.customer_db milestone...")
-            result = conn.execute(refined_query).scalar()
-            if result:
-                ts = pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                logger.info(f"⏰ Anchoring OData filter to Refined Master Milestone: {ts}")
-                return ts
+            raw_query = text(f'SELECT MAX(GREATEST("__system_createdAt", COALESCE("__system_updatedAt", "__system_createdAt"))) FROM "{TARGET_SCHEMA}"."{raw_table}";')
+            with engine.connect() as conn:
+                result = conn.execute(raw_query).scalar()
+                if result:
+                    return pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         except Exception as e:
-            logger.warning(f"⚠️ Master clock scan skipped or failed: {e}. Defaulting to full fetch.")
-    return No
+            logger.warning(f"⚠️ Could not parse raw master clock for {raw_table}: {e}")
+    else:
+        logger.info(f"ℹ️ Raw table {TARGET_SCHEMA}.{raw_table} does not exist yet. Checking Refined schema fallback...")
 
+    # 2. Fallback: If it's the Customers_DB dataset, reference the manual 156k seed table
+    if dataset_name.lower() in ["customers_db", "customers", "customer_db"]:
+        if inspector.has_table("customer_db", schema="data_refined"):
+            try:
+                refined_query = text('SELECT MAX(GREATEST("__createdat", COALESCE("__updatedat", "__createdat"))) FROM data_refined.customer_db;')
+                with engine.connect() as conn:
+                    result = conn.execute(refined_query).scalar()
+                    if result:
+                        ts = pd.Timestamp(result).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                        logger.info(f"🎯 Milestone Match! Anchoring OData filter to Refined Baseline: {ts}")
+                        return ts
+            except Exception as e:
+                logger.warning(f"⚠️ Refined fallback lookup failed: {e}")
+        else:
+            logger.warning("⚠️ High-priority check failed: data_refined.customer_db table not found.")        
+    return None
+    
 # 5. ODK API Integration Functions
 @retry_api
 def discover_datasets(project_id):
