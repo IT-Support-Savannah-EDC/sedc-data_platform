@@ -191,7 +191,7 @@ def sync_dataset_raw(dataset_name, project_id, dry_run=False):
     logger.info(f"✅ Successfully written {count} records into {TARGET_SCHEMA}.{db_table_name}")
 
 if __name__ == "__main__":
-    DRY_RUN_TOGGLE = True 
+    DRY_RUN_TOGGLE = False 
     
     logger.info("🎬 Initializing Adjusted ODK Raw Extractor Engine...")
     try:
