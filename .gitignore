@@ -1,0 +1,6 @@
+config/.env
+config/pyodk_config.toml
+logs/
+venv/
+__pycache__/
+*.pyc
