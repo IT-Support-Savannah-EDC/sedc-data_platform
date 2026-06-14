@@ -43,7 +43,7 @@ def validate_config():
 env_data = validate_config()
 PROJECT_ID = env_data["PROJECT_ID"]
 engine = create_engine(env_data["DATABASE_URL"], pool_pre_ping=True)
-client = Client(config_path="/opt/data_platform/config/pyodk_config.toml")
+client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
 
 # 2. Resilience Retry Decorators
 retry_api = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60), reraise=True)
