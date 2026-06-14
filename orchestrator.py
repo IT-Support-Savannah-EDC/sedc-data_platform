@@ -10,17 +10,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def run_script(script_path):
-    """Executes a python script and monitors for failure."""
     logger.info(f"🚀 Launching job: {script_path}")
+    print("\n" + "="*50 + f" START: {script_path} " + "="*50)
     
-    # We use the python binary inside your virtual environment specifically
     python_bin = "/opt/data_platform/venv/bin/python"
     
-    result = subprocess.run([python_bin, script_path], capture_output=True, text=True)
+    # Removing capture_output lets the script logs stream directly to the terminal screen
+    result = subprocess.run([python_bin, script_path])
+    
+    print("="*50 + f" END: {script_path} " + "="*50 + "\n")
     
     if result.returncode != 0:
-        logger.critical(f"❌ Job Failed: {script_path}\nError Output:\n{result.stderr}")
-        # Stop the entire pipeline so we don't load bad data
+        logger.critical(f"❌ Job Failed: {script_path}")
         sys.exit(1)
         
     logger.info(f"✅ Job Succeeded: {script_path}")
@@ -28,10 +29,10 @@ def run_script(script_path):
 if __name__ == "__main__":
     logger.info("🟢 Starting Nightly Data Pipeline...")
     
-    # 1. Extract
+    # 1. Extract from ODK to data_raw
     run_script("/opt/data_platform/extractors/extract_odk.py")
     
-    # 2. Load
+    # 2. Load from data_raw to data_refined
     run_script("/opt/data_platform/loaders/load_refined.py")
     
     logger.info("🏁 Pipeline Execution Complete!")
