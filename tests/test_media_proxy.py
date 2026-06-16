@@ -84,12 +84,12 @@ def discover_lineage(dataset_name, entity_id, filename):
             
             if form_id and sub_uuid:
                 # Save to Cache
-            with engine.begin() as write_conn:
-                write_conn.execute(text("""
-                    INSERT INTO data_staging.test_media_lineage_cache (entity_id, dataset_name, filename, resolved_form_id, resolved_submission_uuid)
-                    VALUES (:e, :d, :f, :form, :sub)
-                    ON CONFLICT (entity_id, filename) DO NOTHING
-                """), {"e": entity_id, "d": dataset_name, "f": filename, "form": form_id, "sub": sub_uuid})
+                with engine.begin() as write_conn:
+                    write_conn.execute(text("""
+                        INSERT INTO data_staging.test_media_lineage_cache (entity_id, dataset_name, filename, resolved_form_id, resolved_submission_uuid)
+                        VALUES (:e, :d, :f, :form, :sub)
+                        ON CONFLICT (entity_id, filename) DO NOTHING
+                    """), {"e": entity_id, "d": dataset_name, "f": filename, "form": form_id, "sub": sub_uuid})
             
             print(f"💾 [CACHE SAVED] Tracked history from ODK: Form={form_id}, Submission={sub_uuid}")
             return form_id, sub_uuid
