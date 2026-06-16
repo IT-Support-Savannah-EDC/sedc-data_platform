@@ -72,14 +72,19 @@ def discover_lineage(dataset_name, entity_id, filename):
     response = odk_client.session.get(history_endpoint, timeout=10)
     response.raise_for_status()
     
+    # Let's print the raw payload to the terminal so we can see it!
+    print(f"📦 Raw Version History: {response.json()}")
+
     for change_event in response.json():
         source = change_event.get("source", {})
         if source.get("type") == "submission":
-            form_id = source.get("formId")
-            sub_uuid = source.get("submissionId")
+            details = source.get("details", {})
+            form_id = details.get("xmlFormId")
+            sub_uuid = details.get("instanceId")
             
-            # Save to Cache
-            with engine.begin() as write_conn:
+            if form_id and sub_uuid:
+                # Save to Cache
+                with engine.begin() as write_conn:
                 write_conn.execute(text("""
                     INSERT INTO data_staging.test_media_lineage_cache (entity_id, dataset_name, filename, resolved_form_id, resolved_submission_uuid)
                     VALUES (:e, :d, :f, :form, :sub)
