@@ -130,6 +130,95 @@ def fetch_entities(project_id, dataset_name, params=None):
     response.raise_for_status()
     return response.json()
 
+@retry_api
+def discover_forms(project_id):
+    """Dynamically fetches all active forms inside the project."""
+    response = client.get(f"projects/{project_id}/forms")
+    response.raise_for_status()
+    return [f['xmlFormId'] for f in response.json()]
+
+def discover_form_structure(client, project_id, form_id):
+    """Interrogates form field definitions to cleanly isolate binary nodes by structural group."""
+    logger.info(f"🧬 Analyzing form structure dynamically for: {form_id}")
+    try:
+        response = client.get(f"projects/{project_id}/forms/{form_id}/fields")
+        response.raise_for_status()
+        schema = response.json()
+    except Exception as e:
+        logger.error(f"❌ Structural scan failed for form {form_id}: {e}")
+        return {"main": [], "repeats": {}}
+
+    meta_map = {"main": [], "repeats": {}}
+    
+    def parse_fields(fields_list, current_repeat_group=None):
+        for field in fields_list:
+            field_name = field['name']
+            field_type = field.get('type')
+            
+            if field_type == 'binary':
+                if current_repeat_group:
+                    meta_map["repeats"].setdefault(current_repeat_group, []).append(field_name)
+                else:
+                    meta_map["main"].append(field_name)
+            elif field_type == 'repeat':
+                parse_fields(field.get('children', []), field_name.lower())
+            elif field_type == 'structure':
+                parse_fields(field.get('children', []), current_repeat_group)
+
+    parse_fields(schema)
+    return meta_map
+
+def extract_all_form_media(client, engine, project_id, form_id):
+    """Extracts raw wide metrics containing binary media parameters into structural staging maps."""
+    structural_map = discover_form_structure(client, project_id, form_id)
+    
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS data_raw.staging_media_payloads (
+                payload_id BIGSERIAL PRIMARY KEY,
+                form_id TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                raw_json JSONB NOT NULL,
+                extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        
+        # Phase A: Main Form Media Targets
+        if structural_map["main"]:
+            select_fields = ["__id"] + structural_map["main"]
+            endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions?$select={','.join(select_fields)}"
+            try:
+                res = client.get(endpoint).json().get('value', [])
+                for record in res:
+                    conn.execute(
+                        text("""
+                            INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
+                            VALUES (:f, 'main', :j)
+                        """), {"f": form_id, "j": pd.io.json.dumps(record)}
+                    )
+                logger.info(f"📥 Pulled {len(res)} main data points for {form_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Main table extract skip for {form_id}: {e}")
+
+        # Phase B: Repeat Group Media Targets
+        for group_name, fields in structural_map["repeats"].items():
+            if not fields:
+                continue
+            select_fields = ["__id", "__Submissions-id"] + fields
+            endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions.ALL.{group_name}?$select={','.join(select_fields)}"
+            try:
+                res = client.get(endpoint).json().get('value', [])
+                for record in res:
+                    conn.execute(
+                        text("""
+                            INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
+                            VALUES (:f, :g, :j)
+                        """), {"f": form_id, "g": group_name, "j": pd.io.json.dumps(record)}
+                    )
+                logger.info(f"📥 Pulled {len(res)} child repeating entries for block: {group_name}")
+            except Exception as e:
+                logger.warning(f"⚠️ Repeat table extract skip for group {group_name}: {e}")
+
 # 6. Schema-Isolated Upsert Engine
 def upsert_raw_data(df, table_name, conflict_key="__id"):
     if df.empty: return 0
@@ -198,5 +287,12 @@ if __name__ == "__main__":
         datasets = discover_datasets(PROJECT_ID)
         for dataset in datasets:
             sync_dataset_raw(dataset, PROJECT_ID, dry_run=DRY_RUN_TOGGLE)
+            
+        # Standalone Form-Media Payload Extraction Phase
+        logger.info("🎬 Initializing Dynamic Schema Media Extraction Link Protocol...")
+        all_forms = discover_forms(PROJECT_ID)
+        for form in all_forms:
+            extract_all_form_media(client, engine, PROJECT_ID, form)
+            
     except Exception as e:
         logger.critical(f"💥 Ingestion engine halted: {e}", exc_info=True)
