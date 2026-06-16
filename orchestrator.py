@@ -4,11 +4,6 @@ import logging
 import sys
 import requests
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from pyodk.client import Client
-
-# Append framework root to path for fluid local imports
-sys.path.append("/opt/data_platform")
 
 load_dotenv("/opt/data_platform/config/.env")
 
@@ -20,12 +15,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-# Engine assets bound directly for Inline Protocol attachment handling
-DATABASE_URL = os.getenv("DATABASE_URL")
-PROJECT_ID = int(os.getenv("PROJECT_ID")) if os.getenv("PROJECT_ID") else None
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
-client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml") if os.path.exists("/opt/data_platform/config/.pyodk_config.toml") else None
 
 def send_to_ai_assistant(status, title, message, raw_logs=""):
     """Packages and dispatches execution state telemetry to the Apps Script AI Assistant."""
@@ -89,54 +78,17 @@ if __name__ == "__main__":
     pipeline_summary = ""
     
     try:
-        # Node 1: Extraction Phase
+        # Node 1: Extraction Phase (Fetches standard datasets and media payloads to data_raw)
         extractor_logs = run_script("/opt/data_platform/extractors/extract_odk.py")
         pipeline_summary += f"=== Extractor Phase ===\n{extractor_logs}\n\n"
         
-        # Node 2: Transform / Load Phase
+        # Node 2: Main Transform / Load Phase (Processes entity data into data_refined)
         loader_logs = run_script("/opt/data_platform/loaders/load_refined.py")
-        pipeline_summary += f"=== Loader Phase ===\n{loader_logs}\n\n"
+        pipeline_summary += f"=== Main Loader Phase ===\n{loader_logs}\n\n"
         
-        # Inline Execution Attachment: Dynamic Schema Media Extraction Link Protocol
-        try:
-            logger.info("🎬 Initializing Dynamic Schema Media Extraction Link Protocol...")
-            pipeline_summary += "=== Media Link Extraction Protocol Execution ===\n"
-            
-            # 1. Extraction Phase
-            from extractors.extract_odk import extract_all_form_media, discover_forms
-            all_forms = discover_forms(PROJECT_ID)
-            for form in all_forms:
-                extract_all_form_media(client, engine, PROJECT_ID, form)
-                
-            # 2. Fetch Data for Transformation Phase
-            with engine.connect() as conn:
-                raw_payloads = conn.execute(text("""
-                    SELECT form_id, group_name, raw_json 
-                    FROM data_raw.staging_media_payloads
-                """)).mappings().all()
-                
-            if raw_payloads:
-                # 3. Transformation Phase
-                from transformers.stage_cleaner import transform_media_payloads
-                df_main, dict_repeats = transform_media_payloads(raw_payloads)
-                
-                # 4. Loader Phase
-                from loaders.load_refined import load_all_media_assets
-                load_all_media_assets(engine, df_main, dict_repeats)
-                
-            logger.info("🏁 Dynamic Schema Media Extraction Link Protocol concluded successfully.")
-            pipeline_summary += "Dynamic Schema Media Extraction Link Protocol concluded successfully.\n\n"
-            
-        except Exception as e:
-            logger.critical(f"💥 Media Extraction Link Protocol failure: {str(e)}")
-            pipeline_summary += f"💥 Media Extraction Link Protocol Failure:\n{str(e)}\n\n"
-            send_to_ai_assistant(
-                status="CRITICAL",
-                title="Media Extraction Link Protocol Failure",
-                message=f"The inline media extraction and link generation tracking protocol failed: {str(e)}",
-                raw_logs=str(e)
-            )
-            sys.exit(1)
+        # Node 3: Dedicated Media Link Phase (Transforms and binds media from data_raw)
+        media_logs = run_script("/opt/data_platform/loaders/load_media.py")
+        pipeline_summary += f"=== Media Link Loader Phase ===\n{media_logs}\n\n"
         
         # If we reach here, everything succeeded perfectly
         logger.info("🏁 Pipeline Execution Flawless! Notifying AI Assistant...")
