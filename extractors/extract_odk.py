@@ -173,6 +173,7 @@ def extract_all_form_media(client, engine, project_id, form_id):
     """Extracts raw wide metrics containing binary media parameters into structural staging maps."""
     structural_map = discover_form_structure(client, project_id, form_id)
     
+    # Ensure staging DDL is verified up front in an isolated transaction
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS data_raw.staging_media_payloads (
@@ -184,41 +185,52 @@ def extract_all_form_media(client, engine, project_id, form_id):
             );
         """))
         
-        # Phase A: Main Form Media Targets
-        if structural_map["main"]:
-            select_fields = ["__id"] + structural_map["main"]
-            endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions?$select={','.join(select_fields)}"
-            try:
-                res = client.get(endpoint).json().get('value', [])
-                for record in res:
-                    conn.execute(
-                        text("""
-                            INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
-                            VALUES (:f, 'main', :j)
-                        """), {"f": form_id, "j": json.dumps(record)}
-                    )
-                logger.info(f"📥 Pulled {len(res)} main data points for {form_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Main table extract skip for {form_id}: {e}")
+    records_to_insert = []
+    
+    # Phase A: Main Form Media Targets (Network I/O Isolated from DB transaction)
+    if structural_map["main"]:
+        select_fields = ["__id"] + structural_map["main"]
+        endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions?$select={','.join(select_fields)}"
+        try:
+            res = client.get(endpoint).json().get('value', [])
+            for record in res:
+                records_to_insert.append({
+                    "form_id": form_id,
+                    "group_name": "main",
+                    "raw_json": json.dumps(record)
+                })
+            logger.info(f"📥 Pulled {len(res)} main data points for {form_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Main table extract skip for {form_id}: {e}")
 
-        # Phase B: Repeat Group Media Targets
-        for group_name, fields in structural_map["repeats"].items():
-            if not fields:
-                continue
-            select_fields = ["__id", "__Submissions-id"] + fields
-            endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions.ALL.{group_name}?$select={','.join(select_fields)}"
-            try:
-                res = client.get(endpoint).json().get('value', [])
-                for record in res:
-                    conn.execute(
-                        text("""
-                            INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
-                            VALUES (:f, :g, :j)
-                        """), {"f": form_id, "g": group_name, "j": json.dumps(record)}
-                    )
-                logger.info(f"📥 Pulled {len(res)} child repeating entries for block: {group_name}")
-            except Exception as e:
-                logger.warning(f"⚠️ Repeat table extract skip for group {group_name}: {e}")
+    # Phase B: Repeat Group Media Targets (Network I/O Isolated from DB transaction)
+    for group_name, fields in structural_map["repeats"].items():
+        if not fields:
+            continue
+        select_fields = ["__id", "__Submissions-id"] + fields
+        endpoint = f"projects/{project_id}/forms/{form_id}.svc/Submissions.ALL.{group_name}?$select={','.join(select_fields)}"
+        try:
+            res = client.get(endpoint).json().get('value', [])
+            for record in res:
+                records_to_insert.append({
+                    "form_id": form_id,
+                    "group_name": group_name,
+                    "raw_json": json.dumps(record)
+                })
+            logger.info(f"📥 Pulled {len(res)} child repeating entries for block: {group_name}")
+        except Exception as e:
+            logger.warning(f"⚠️ Repeat table extract skip for group {group_name}: {e}")
+
+    # Write staging metrics cleanly in an isolated batch transaction
+    if records_to_insert:
+        with engine.begin() as conn:
+            for record in records_to_insert:
+                conn.execute(
+                    text("""
+                        INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
+                        VALUES (:form_id, :group_name, :raw_json)
+                    """), record
+                )
 
 # 6. Schema-Isolated Upsert Engine
 def upsert_raw_data(df, table_name, conflict_key="__id"):
@@ -297,3 +309,7 @@ if __name__ == "__main__":
             
     except Exception as e:
         logger.critical(f"💥 Ingestion engine halted: {e}", exc_info=True)
+    finally:
+        logger.info("🧹 Releasing open connection pools...")
+        engine.dispose()
+        logger.info("🏁 Script execution successfully wrapped up.")
