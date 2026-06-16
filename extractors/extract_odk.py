@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import logging
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
@@ -194,7 +195,7 @@ def extract_all_form_media(client, engine, project_id, form_id):
                         text("""
                             INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
                             VALUES (:f, 'main', :j)
-                        """), {"f": form_id, "j": pd.io.json.dumps(record)}
+                        """), {"f": form_id, "j": json.dumps(record)}
                     )
                 logger.info(f"📥 Pulled {len(res)} main data points for {form_id}")
             except Exception as e:
@@ -213,7 +214,7 @@ def extract_all_form_media(client, engine, project_id, form_id):
                         text("""
                             INSERT INTO data_raw.staging_media_payloads (form_id, group_name, raw_json)
                             VALUES (:f, :g, :j)
-                        """), {"f": form_id, "g": group_name, "j": pd.io.json.dumps(record)}
+                        """), {"f": form_id, "g": group_name, "j": json.dumps(record)}
                     )
                 logger.info(f"📥 Pulled {len(res)} child repeating entries for block: {group_name}")
             except Exception as e:
