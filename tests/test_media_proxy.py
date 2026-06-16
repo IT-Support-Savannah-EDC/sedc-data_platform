@@ -77,10 +77,12 @@ def discover_lineage(dataset_name, entity_id, filename):
 
     for change_event in response.json():
         source = change_event.get("source", {})
-        if source.get("type") == "submission":
-            details = source.get("details", {})
-            form_id = details.get("xmlFormId")
-            sub_uuid = details.get("instanceId")
+        submission_data = source.get("submission")
+        
+        # If this event was triggered by a form submission, grab the keys
+        if submission_data:
+            form_id = submission_data.get("xmlFormId")
+            sub_uuid = submission_data.get("instanceId")
             
             if form_id and sub_uuid:
                 # Save to Cache
@@ -90,9 +92,9 @@ def discover_lineage(dataset_name, entity_id, filename):
                         VALUES (:e, :d, :f, :form, :sub)
                         ON CONFLICT (entity_id, filename) DO NOTHING
                     """), {"e": entity_id, "d": dataset_name, "f": filename, "form": form_id, "sub": sub_uuid})
-            
-            print(f"💾 [CACHE SAVED] Tracked history from ODK: Form={form_id}, Submission={sub_uuid}")
-            return form_id, sub_uuid
+                
+                print(f"💾 [CACHE SAVED] Tracked history from ODK: Form={form_id}, Submission={sub_uuid}")
+                return form_id, sub_uuid
             
     raise FileNotFoundError("Could not find a submission source in this entity's history log.")
 
