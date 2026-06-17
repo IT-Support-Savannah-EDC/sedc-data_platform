@@ -24,10 +24,10 @@ def send_to_ai_assistant(status, title, message, raw_logs=""):
         return
     
     payload = {
-        "status": status,          # "SUCCESS", "CRITICAL", or "WARNING"
-        "title": title,            # Component name identifier
-        "message": message,        # Context summary
-        "raw_logs": raw_logs,      # Captured terminal stdout/stderr streams
+        "status": status,
+        "title": title,
+        "message": message,
+        "raw_logs": raw_logs,
         "environment": "Production (ELT-Droplet)"
     }
     
@@ -41,19 +41,18 @@ def send_to_ai_assistant(status, title, message, raw_logs=""):
         logger.error(f"⚠️ Telemetry transport layer breakdown: {e}")
 
 def run_script(script_path):
+    """Executes a standalone script via subprocess."""
     script_name = os.path.basename(script_path)
     logger.info(f"🚀 Launching pipeline node: {script_name}")
     
     python_bin = "/opt/data_platform/venv/bin/python"
     
-    # Run and capture the exact console outputs
     result = subprocess.run(
         [python_bin, script_path], 
         capture_output=True, 
         text=True
     )
     
-    # Keep cron.log happy by printing out what happened
     if result.stdout:
         print(result.stdout.strip())
     if result.stderr:
@@ -79,17 +78,22 @@ if __name__ == "__main__":
     pipeline_summary = ""
     
     try:
-        # Node 1: Extraction Phase (Fetches standard datasets and media payloads to data_raw)
+        # Node 1: Extraction Phase
         extractor_logs = run_script("/opt/data_platform/extractors/extract_odk.py")
         pipeline_summary += f"=== Extractor Phase ===\n{extractor_logs}\n\n"
         
-        # Node 2: Main Transform / Load Phase (Processes entity data into data_refined)
+        # Node 2: Main Transform / Load Phase
         loader_logs = run_script("/opt/data_platform/loaders/load_refined.py")
         pipeline_summary += f"=== Main Loader Phase ===\n{loader_logs}\n\n"
         
-        # Node 3: Dedicated Media Link Phase (Transforms and binds media from data_raw)
+        # Node 3: Media Link Phase (Legacy/Specific Media Handling)
         media_logs = run_script("/opt/data_platform/loaders/load_media.py")
         pipeline_summary += f"=== Media Link Loader Phase ===\n{media_logs}\n\n"
+        
+        # Node 4: Native Stage Cleaner Phase (Vectorized Transformation)
+        logger.info("🧹 Launching Native Pipeline Node: Stage Cleaner")
+        run_cleaning_pipeline()
+        pipeline_summary += "=== Native Stage Cleaner Phase ===\nSuccessfully executed vectorized transformations.\n\n"
         
         # If we reach here, everything succeeded perfectly
         logger.info("🏁 Pipeline Execution Flawless! Notifying AI Assistant...")
