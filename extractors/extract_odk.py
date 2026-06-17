@@ -55,26 +55,39 @@ def sync_schema(df, table_name):
 def get_smart_master_clock(dataset_name):
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
-    
-    refined_table = {base_name}
+
+    raw_table = f"entity_{base_name}"
+    refined_table = base_name
     
     inspector = inspect(engine)
+
+    # Priority 1
     if inspector.has_table(refined_table, schema="data_refined"):
-        try: 
-            # This allows Postgres to use indexes and execute instantly.
-            query = text(f'''
-                SELECT 
-                    MAX("__system_updatedAt") as max_up, 
-                    MAX("__system_createdAt") as max_cr 
-                FROM "data_refined"."{refined_table}";
-            ''')
-            with engine.connect() as conn:
-                res = conn.execute(query).fetchone()
-                if res and res[0] is not None:
-                    return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-        except Exception as e:
-            logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
-    return None
+        target_schema = "data_refined"
+        target_table = refined_table
+
+    # Priority 2
+    elif inspector.has_table(raw_table, schema="data_raw"):
+        target_schema = "data.raw"
+        target_table = raw_table
+    # Priority 3
+    else:
+        return None
+    try: 
+        # This allows Postgres to use indexes and execute instantly.
+        query = text(f'''
+            SELECT 
+                MAX("__system_updatedAt") as max_up, 
+                MAX("__system_createdAt") as max_cr 
+            FROM "data_refined"."{refined_table}";
+        ''')
+        with engine.connect() as conn:
+            res = conn.execute(query).fetchone()
+            if res and res[0] is not None:
+                return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
+return None
 
 def fetch_entities_paginated(project_id, dataset_name, params=None):
     """
