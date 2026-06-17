@@ -68,9 +68,10 @@ def upsert_to_staging(df, table_name):
         df.head(0).to_sql(staging_table, schema_conn, schema='data_staging', if_exists='append', index=False)
         schema_conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{staging_table}_{conflict_key}_idx" ON data_staging."{staging_table}" ("{conflict_key}");'))
 
-    temp_holder = f"temp_{staging_table}"
+    temp_holder = f"temp_{staging_table}_{int(pd.Timestamp.now().timestamp())}"
     with engine.begin() as conn:
-        df.to_sql(temp_holder, conn, if_exists='replace', index=False)
+        # 🚨 FIX: Added chunksize here as well to protect the database insert
+        df.to_sql(temp_holder, conn, if_exists='replace', index=False, chunksize=1000)
         cols_str = ", ".join([f'"{c}"' for c in df.columns])
         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
         
@@ -89,8 +90,15 @@ def run_cleaning_pipeline():
     for raw_table in raw_tables:
         if raw_table.startswith('temp_'):
             continue
+            
+        logger.info(f"📦 Processing raw table {raw_table} in safe memory chunks...")
         engine = get_engine()
-        df_raw = pd.read_sql_table(raw_table, con=engine, schema='data_raw')
         clean_dataset_name = raw_table.replace("entity_", "")
-        df_cleaned = clean_and_vectorize_media(df_raw, clean_dataset_name)
-        upsert_to_staging(df_cleaned, clean_dataset_name)
+        
+        # 🚨 FIX: Chunking the data read. Instead of loading everything into RAM at once,
+        # it streams 2,500 rows at a time, processes them, and flushes memory.
+        for chunk_df in pd.read_sql_table(raw_table, con=engine, schema='data_raw', chunksize=2500):
+            df_cleaned = clean_and_vectorize_media(chunk_df, clean_dataset_name)
+            upsert_to_staging(df_cleaned, clean_dataset_name)
+            
+    logger.info("✅ Cleaning Pipeline Operations Completed.")
