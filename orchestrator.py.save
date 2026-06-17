@@ -4,6 +4,7 @@ import logging
 import sys
 import requests
 from dotenv import load_dotenv
+from extractors.extract_odk import run_extraction
 from transformers.stage_cleaner import run_cleaning_pipeline
 
 load_dotenv("/opt/data_platform/config/.env")
@@ -86,7 +87,6 @@ if __name__ == "__main__":
         loader_logs = run_script("/opt/data_platform/loaders/load_refined.py")
         pipeline_summary += f"=== Main Loader Phase ===\n{loader_logs}\n\n"
         
-        # Node 3: Media Link Phase (Legacy/Specific Media Handling)
         pipeline_summary += f"=== Media Link Loader Phase ===\n{media_logs}\n\n"
         
         # Node 4: Native Stage Cleaner Phase (Vectorized Transformation)
