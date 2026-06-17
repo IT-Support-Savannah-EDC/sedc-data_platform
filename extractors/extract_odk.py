@@ -70,17 +70,20 @@ def get_smart_master_clock(dataset_name):
     elif inspector.has_table(raw_table, schema="data_raw"):
         target_schema = "data.raw"
         target_table = raw_table
+        
     # Priority 3
     else:
         return None
+        
     try: 
         # This allows Postgres to use indexes and execute instantly.
         query = text(f'''
             SELECT 
                 MAX("__system_updatedAt") as max_up, 
                 MAX("__system_createdAt") as max_cr 
-            FROM "data_refined"."{refined_table}";
+            FROM "{target_schema}"."{refined_table}";
         ''')
+        
         with engine.connect() as conn:
             res = conn.execute(query).fetchone()
             if res and res[0] is not None:
