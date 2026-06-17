@@ -4,6 +4,7 @@ import logging
 import sys
 import requests
 from dotenv import load_dotenv
+from transformers.stage_cleaner import run_cleaning_pipeline
 
 load_dotenv("/opt/data_platform/config/.env")
 
