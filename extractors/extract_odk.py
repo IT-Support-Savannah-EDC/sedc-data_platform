@@ -85,7 +85,7 @@ def get_smart_master_clock(dataset_name):
         ''')
         
         with engine.connect() as conn:
-            res = conn.execute(query).fetchone()
+            res = conn.execute(query).scalar()
             if res and res[0] is not None:
                 return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     except Exception as e:
