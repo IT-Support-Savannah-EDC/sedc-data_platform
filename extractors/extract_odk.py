@@ -58,7 +58,7 @@ def get_smart_master_clock(dataset_name):
     raw_table = f"entity_{base_name}"
     
     inspector = inspect(engine)
-    if inspector.has_table(raw_table, schema=TARGET_SCHEMA):
+    if inspector.has_table(raw_table, schema="data_refined"):
         try:
             # FIX: Removed the GREATEST/COALESCE table scan trap. 
             # This allows Postgres to use indexes and execute instantly.
@@ -66,7 +66,7 @@ def get_smart_master_clock(dataset_name):
                 SELECT 
                     MAX("__system_updatedAt") as max_up, 
                     MAX("__system_createdAt") as max_cr 
-                FROM "{TARGET_SCHEMA}"."{raw_table}";
+                FROM "{"data_refined"}"."{refined_table}";
             ''')
             with engine.connect() as conn:
                 res = conn.execute(query).fetchone()
@@ -75,7 +75,7 @@ def get_smart_master_clock(dataset_name):
                     if vals:
                         return max(vals).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         except Exception as e:
-            logger.warning(f"⚠️ Could not read clock from {TARGET_SCHEMA}.{raw_table}: {e}")
+            logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
     return None
 
 def fetch_entities_paginated(project_id, dataset_name, params=None):
