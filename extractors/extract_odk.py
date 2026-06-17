@@ -55,12 +55,12 @@ def sync_schema(df, table_name):
 def get_smart_master_clock(dataset_name):
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
-    raw_table = f"entity_{base_name}"
+    
+    refined_table = f"entity_{base_name}"
     
     inspector = inspect(engine)
     if inspector.has_table(raw_table, schema="data_refined"):
-        try:
-            # FIX: Removed the GREATEST/COALESCE table scan trap. 
+        try: 
             # This allows Postgres to use indexes and execute instantly.
             query = text(f'''
                 SELECT 
