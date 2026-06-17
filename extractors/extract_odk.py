@@ -68,7 +68,7 @@ def get_smart_master_clock(dataset_name):
 
     # Priority 2
     elif inspector.has_table(raw_table, schema="data_raw"):
-        target_schema = "data.raw"
+        target_schema = "data_raw"
         target_table = raw_table
         
     # Priority 3
