@@ -59,7 +59,7 @@ def get_smart_master_clock(dataset_name):
     refined_table = f"entity_{base_name}"
     
     inspector = inspect(engine)
-    if inspector.has_table(raw_table, schema="data_refined"):
+    if inspector.has_table(refined_table, schema="data_refined"):
         try: 
             # This allows Postgres to use indexes and execute instantly.
             query = text(f'''
@@ -70,10 +70,8 @@ def get_smart_master_clock(dataset_name):
             ''')
             with engine.connect() as conn:
                 res = conn.execute(query).fetchone()
-                if res:
-                    vals = [pd.Timestamp(v) for v in res if v is not None]
-                    if vals:
-                        return max(vals).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                if res and res[0] is not None:
+                    return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         except Exception as e:
             logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
     return None
