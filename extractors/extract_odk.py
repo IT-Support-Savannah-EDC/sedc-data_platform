@@ -81,7 +81,7 @@ def get_smart_master_clock(dataset_name):
             SELECT 
                 MAX("__system_updatedAt") as max_up, 
                 MAX("__system_createdAt") as max_cr 
-            FROM "{target_schema}"."{refined_table}";
+            FROM "{target_schema}"."{target_table}";
         ''')
         
         with engine.connect() as conn:
@@ -89,7 +89,7 @@ def get_smart_master_clock(dataset_name):
             if res and res[0] is not None:
                 return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     except Exception as e:
-        logger.warning(f"⚠️ Could not read clock from data_refined.{refined_table}: {e}")
+        logger.warning(f"⚠️ Could not read clock from {target_schema}.{refined_table}: {e}")
     return None
 
 def fetch_entities_paginated(project_id, dataset_name, params=None):
