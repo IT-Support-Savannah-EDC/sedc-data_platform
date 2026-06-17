@@ -99,14 +99,15 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
     
     # Ensure baseline table framework exists
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
-    
-    # Run structural check to add any new columns safely (NO recursive loop)
     sync_schema(df, table_name)
     
     try:
         with engine.begin() as conn:
             conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
-            df.to_sql(staging_table, conn, if_exists='append', index=False, method='multi')
+            
+            # 🚨 FIX: Replaced method='multi' with chunksize=1000 to prevent RAM explosions
+            df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
+            
             conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{table_name}_{conflict_key}_idx" ON "{TARGET_SCHEMA}"."{table_name}" ("{conflict_key}");'))
             
             cols = [f'"{c}"' for c in df.columns]
@@ -123,7 +124,7 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
         with engine.connect() as cleanup_conn:
             cleanup_conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
             cleanup_conn.commit()
-
+            
 def sync_dataset_raw(dataset_name, project_id):
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": 
