@@ -56,7 +56,7 @@ def get_smart_master_clock(dataset_name):
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
     
-    refined_table = f"entity_{base_name}"
+    refined_table = {base_name}
     
     inspector = inspect(engine)
     if inspector.has_table(refined_table, schema="data_refined"):
