@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def validate_config():
-    required_vars = {"EPU_ASSISTANT_URL": "EPU Assistant Webhook URL", "PROJECT_ID": "ODK Project ID", "DATABASE_URL": "PostgreSQL Database URL"}
+    required_vars = {"EPU_ASSISTANT_URL": "Webhook URL", "PROJECT_ID": "Project ID", "DATABASE_URL": "DB URL"}
     missing = [var for var in required_vars if not os.getenv(var)]
     if missing:
         logger.critical(f"❌ MISSING CONFIGURATION: {', '.join(missing)}")
@@ -32,24 +32,16 @@ PROJECT_ID, DB_URL = validate_config()
 engine = create_engine(DB_URL, pool_pre_ping=True)
 client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
 
-# 2. Resilience Retry Decorators
-retry_api = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60), reraise=True)
 retry_db = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=50),
                  retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
 
 @retry_db
 def sync_schema(df, table_name):
-    """Safely adds missing columns to the raw database table based on incoming DataFrame."""
-    if df.empty: 
-        return
-    
+    if df.empty: return
     with engine.connect() as conn:
-        # Verify the table actually exists first
         exists_query = text("SELECT exists (SELECT FROM pg_tables WHERE schemaname = :s AND tablename = :t)")
-        if not conn.execute(exists_query, {"s": TARGET_SCHEMA, "t": table_name}).scalar(): 
-            return
+        if not conn.execute(exists_query, {"s": TARGET_SCHEMA, "t": table_name}).scalar(): return
         
-        # Get existing columns
         query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = :t")
         existing_cols = {row[0] for row in conn.execute(query, {"s": TARGET_SCHEMA, "t": table_name}).fetchall()}
     
@@ -58,94 +50,119 @@ def sync_schema(df, table_name):
         logger.info(f"🧬 Schema Evolution: Adding {len(new_cols)} columns to {TARGET_SCHEMA}.{table_name}")
         with engine.begin() as transaction_conn:
             for col in new_cols:
-                # Wrap column names in double quotes to handle system fields safely
                 transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
 
 def get_smart_master_clock(dataset_name):
     base_name = dataset_name.replace(' ', '_').lower()
-    if base_name == "customers_db": 
-        base_name = "customer_db"
+    if base_name == "customers_db": base_name = "customer_db"
     raw_table = f"entity_{base_name}"
     
     inspector = inspect(engine)
     if inspector.has_table(raw_table, schema=TARGET_SCHEMA):
         try:
-            query = text(f'SELECT MAX(GREATEST("__system_createdAt", COALESCE("__system_updatedAt", "__system_createdAt"))) FROM "{TARGET_SCHEMA}"."{raw_table}";')
+            # FIX: Removed the GREATEST/COALESCE table scan trap. 
+            # This allows Postgres to use indexes and execute instantly.
+            query = text(f'''
+                SELECT 
+                    MAX("__system_updatedAt") as max_up, 
+                    MAX("__system_createdAt") as max_cr 
+                FROM "{TARGET_SCHEMA}"."{raw_table}";
+            ''')
             with engine.connect() as conn:
-                res = conn.execute(query).scalar()
-                if res: 
-                    return pd.Timestamp(res).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                res = conn.execute(query).fetchone()
+                if res:
+                    vals = [pd.Timestamp(v) for v in res if v is not None]
+                    if vals:
+                        return max(vals).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         except Exception as e:
             logger.warning(f"⚠️ Could not read clock from {TARGET_SCHEMA}.{raw_table}: {e}")
     return None
 
-@retry_api
+def fetch_entities_paginated(project_id, dataset_name, params=None):
+    """
+    FIX: Prevents OOM crashes by strictly paginating the API call.
+    Yields data in safe 2,000-record chunks.
+    """
+    if params is None: params = {}
+    skip = 0
+    top = 2000  
+    
+    while True:
+        current_params = params.copy()
+        current_params['$top'] = top
+        current_params['$skip'] = skip
+        
+        logger.info(f"📡 Downloading API chunk: records {skip} to {skip+top}...")
+        response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", params=current_params)
+        response.raise_for_status()
+        
+        data = response.json().get('value', [])
+        if not data:
+            break
+            
+        yield data
+        
+        if len(data) < top:
+            break 
+            
+        skip += top
+
 def discover_datasets(project_id):
     response = client.get(f"projects/{project_id}/datasets")
     response.raise_for_status()
     return [ds['name'] for ds in response.json()]
 
-@retry_api
-def fetch_entities(project_id, dataset_name, params=None):
-    response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", params=params)
-    response.raise_for_status()
-    return response.json()
-
 def upsert_raw_data(df, table_name, conflict_key="__id"):
-    if df.empty: 
-        return 0
-    
+    if df.empty: return 0
     staging_table = f"temp_{table_name}_{int(time.time())}"
-    
-    # Ensure baseline table framework exists
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
     sync_schema(df, table_name)
     
-    try:
-        with engine.begin() as conn:
+    # FIX: Everything now happens strictly inside ONE connection context to prevent table leaks
+    with engine.begin() as conn:
+        try:
             conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
-            
-            # 🚨 FIX: Replaced method='multi' with chunksize=1000 to prevent RAM explosions
             df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
-            
-            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{table_name}_{conflict_key}_idx" ON "{TARGET_SCHEMA}"."{table_name}" ("{conflict_key}");'))
+            conn.execute(text(f'CREATE UNIQUE INDEX ON "{staging_table}" ("{conflict_key}");'))
             
             cols = [f'"{c}"' for c in df.columns]
             update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
+            conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
+        finally:
+            # Drop command stays inside the same transaction
+            conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
             
-            upsert_query = text(f"""
-                INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) 
-                SELECT {", ".join(cols)} FROM "{staging_table}" 
-                ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}
-            """)
-            conn.execute(upsert_query)
-            return len(df)
-    finally:
-        with engine.connect() as cleanup_conn:
-            cleanup_conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
-            cleanup_conn.commit()
-            
+    return len(df)
+
 def sync_dataset_raw(dataset_name, project_id):
     base_name = dataset_name.replace(' ', '_').lower()
-    if base_name == "customers_db": 
-        base_name = "customer_db"
+    if base_name == "customers_db": base_name = "customer_db"
     db_table_name = f"entity_{base_name}"
     
     last_update = get_smart_master_clock(dataset_name)
     params = {"$filter": f"__system/updatedAt gt {last_update}"} if last_update else {}
     
-    res = fetch_entities(project_id, dataset_name, params=params)
-    if not res or 'value' not in res or not res['value']:
-        logger.info(f"⏸️ No updates found for dataset: {dataset_name}")
-        return
-    
-    df = pd.json_normalize(res['value'], sep='_')
-    count = upsert_raw_data(df, db_table_name, conflict_key="__id")
-    logger.info(f"✅ Written {count} records into {TARGET_SCHEMA}.{db_table_name}")
+    total_written = 0
+    # Process the data in strict memory-safe pages
+    for page_records in fetch_entities_paginated(project_id, dataset_name, params=params):
+        df = pd.json_normalize(page_records, sep='_')
+        
+        # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                df[col] = df[col].astype(str)
+                
+        count = upsert_raw_data(df, db_table_name, conflict_key="__id")
+        total_written += count
+        
+    if total_written > 0:
+        logger.info(f"✅ Securely committed {total_written} records to {TARGET_SCHEMA}.{db_table_name}")
+    else:
+        logger.info(f"⏸️ No delta updates found for '{dataset_name}'.")
 
 if __name__ == "__main__":
     try:
-        logger.info("🎬 Initializing Adjusted ODK Raw Extractor Engine...")
+        logger.info("🎬 Initializing High-Performance Paginated Extractor...")
         for dataset in discover_datasets(PROJECT_ID):
             sync_dataset_raw(dataset, PROJECT_ID)
     except Exception as e:
