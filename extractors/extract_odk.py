@@ -66,7 +66,7 @@ def get_smart_master_clock(dataset_name):
                 SELECT 
                     MAX("__system_updatedAt") as max_up, 
                     MAX("__system_createdAt") as max_cr 
-                FROM "{"data_refined"}"."{refined_table}";
+                FROM "data_refined"."{refined_table}";
             ''')
             with engine.connect() as conn:
                 res = conn.execute(query).fetchone()
