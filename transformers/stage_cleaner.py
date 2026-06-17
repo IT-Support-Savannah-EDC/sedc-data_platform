@@ -9,8 +9,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DB_URI = os.getenv("DATABASE_URL")
-engine = create_engine(DB_URI, pool_pre_ping=True)
+def get_engine():
+    # Load env every time we request the engine to ensure it's fresh
+    load_dotenv("/opt/data_platform/config/.env")
+    db_uri = os.getenv("DATABASE_URL")
+    if not db_uri:
+        raise ValueError("DATABASE_URL not found in .env file!")
+    return create_engine(db_uri, pool_pre_ping=True)
 
 # Define your application server production proxy route prefix
 PROXY_BASE_URL = "http://134.209.178.35:5050/media"
@@ -18,6 +23,7 @@ MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.mp4', '.3gp', '.wav', '.mp3')
 
 def discover_raw_tables():
     """Scans the data_raw schema for ingest tables to process."""
+    engine = get_engine
     inspector = inspect(engine)
     tables = inspector.get_table_names(schema='data_raw')
     return tables
