@@ -84,24 +84,34 @@ def proxy_media(dataset_name, entity_id, filename):
         
         # 2. Clean and URL-encode parameters safely
         clean_uuid = submission_uuid.replace("uuid:", "").strip()
-        safe_filename = quote(filename.strip())
-        safe_form_id = quote(form_id.strip())
         
-        # Construct the target endpoint
-        binary_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{safe_filename}"
+        # Strip white space and handle variations
+        safe_filename = filename.strip()
+        safe_form_id = form_id.strip()
         
-        print(f"📡 [PROXY STREAM] Fetching asset via pyodk session from: {binary_url}")
+        # Primary URL construction (Standard ODK Central Submission Attachment)
+        binary_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{quote(safe_form_id)}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
         
-        # 3. FIX: Use client.session instead of requests.get to inherit pristine auth states
-        # stream=True keeps memory footprints tiny
+        print(f"📡 [TRY 1] Fetching standard asset path:\n   👉 {binary_url}")
         odk_response = client.session.get(binary_url, stream=True)
         
+        # 3. Fallback Strategy: Try unquoted Form ID (needed for certain ODK setups)
+        if odk_response.status_code == 404:
+            alt_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
+            print(f"🔄 [TRY 2 - FALLBACK] Attempting unquoted Form ID path:\n   👉 {alt_url}")
+            odk_response = client.session.get(alt_url, stream=True)
+
+        # 4. Final Fallback Strategy: Try Entity-native file attachment if available in your ODK version
+        if odk_response.status_code == 404:
+            entity_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/datasets/{dataset_name}/entities/{entity_id}/attachments/{quote(safe_filename)}"
+            print(f"🔄 [TRY 3 - FALLBACK] Attempting direct Entity attachment path:\n   👉 {entity_url}")
+            odk_response = client.session.get(entity_url, stream=True)
+        
+        # Evaluate final status code response
         if odk_response.status_code != 200:
-            print(f"❌ ODK Central responded with status {odk_response.status_code}")
-            print(f"📝 Response Body context: {odk_response.text[:200]}") # Log first 200 chars of the error
-            return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=502)
+            print(f"❌ All streaming routes returned 404 for file: {filename}")
+            return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=odk_response.status_code)
             
-        # 4. Deliver chunked response stream directly to browser
         return Response(
             stream_with_context(odk_response.iter_content(chunk_size=8192)),
             content_type=odk_response.headers.get("Content-Type")
