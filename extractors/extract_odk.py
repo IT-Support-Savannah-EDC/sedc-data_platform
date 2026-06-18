@@ -171,6 +171,9 @@ def sync_dataset_raw(dataset_name, project_id):
             continue
             
         df = pd.json_normalize(page_records, sep='_')
+
+        # Convert all hyphens to underscores globally to protect Postgres & Metabase
+        df.columns = [c.replace('-', '_').lower().strip() for c in df.columns]
         
         # FIX: Handle ODK ignoring filters by strictly dropping stale data client-side
         if last_update and '__system_updatedAt' in df.columns:
