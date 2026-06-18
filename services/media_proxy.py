@@ -79,32 +79,47 @@ def discover_lineage(dataset_name, entity_id, filename):
 @app.route("/media/<dataset_name>/<entity_id>/<filename>", methods=["GET"])
 def proxy_media(dataset_name, entity_id, filename):
     try:
-        # 1. Attempt Direct Entity Attachment (Most reliable for Entity-based systems)
-        # Path: /v1/projects/{projectId}/datasets/{dataset_name}/entities/{entity_id}/attachments/{filename}
-        entity_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/datasets/{dataset_name}/entities/{entity_id}/attachments/{quote(filename)}"
-        print(f"📡 [TRY 1] Fetching direct Entity attachment:\n    👉 {entity_url}")
-        odk_response = client.session.get(entity_url, stream=True)
-
-        # 2. Fallback to Submission-based attachment if Entity check fails
+        safe_filename = filename.strip()
+        
+        # Strategy 1: Direct Entity-native file attachment path (Bypasses Lineage Lookup entirely if supported)
+        # Note: We pass a RELATIVE path because pyodk automatically prefixes the Base URL and /v1
+        entity_rel_path = f"projects/{PROJECT_ID}/datasets/{dataset_name}/entities/{entity_id}/attachments/{quote(safe_filename)}"
+        print(f"📡 [TRY 1] Fetching relative Entity attachment path:\n    👉 {entity_rel_path}")
+        odk_response = client.session.get(entity_rel_path, stream=True)
+        
+        # Strategy 2: Fallback to Submission Lineage Lookup if direct entity path returns a 404
         if odk_response.status_code == 404:
-            print("🔄 [TRY 2] Entity attachment not found, falling back to submission lineage...")
-            form_id, submission_uuid = discover_lineage(dataset_name, entity_id, filename)
-            clean_uuid = submission_uuid.replace("uuid:", "").strip()
+            print("🔄 [TRY 2] Direct Entity path returned 404. Dropping down to Submission Lineage Lookup...")
             
-            sub_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{quote(form_id)}/submissions/{clean_uuid}/attachments/{quote(filename)}"
-            print(f"    👉 {sub_url}")
-            odk_response = client.session.get(sub_url, stream=True)
+            # This handles database cache checking or API inspection safely
+            form_id, submission_uuid = discover_lineage(dataset_name, entity_id, safe_filename)
+            clean_uuid = submission_uuid.replace("uuid:", "").strip()
+            safe_form_id = form_id.strip()
+            
+            # Use relative path for standard submission endpoint
+            sub_rel_path = f"projects/{PROJECT_ID}/forms/{quote(safe_form_id)}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
+            print(f"    👉 Fetching relative Submission path: {sub_rel_path}")
+            odk_response = client.session.get(sub_rel_path, stream=True)
+            
+            # Strategy 3: Try unquoted Form ID fallback (handles unique ODK system configurations)
+            if odk_response.status_code == 404:
+                alt_rel_path = f"projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
+                print(f"🔄 [TRY 3] Attempting unquoted Form ID path:\n    👉 {alt_rel_path}")
+                odk_response = client.session.get(alt_rel_path, stream=True)
 
+        # Evaluate final response status from ODK Central
         if odk_response.status_code != 200:
+            print(f"❌ All streaming routes returned {odk_response.status_code} for file: {safe_filename}")
             return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=odk_response.status_code)
             
         return Response(
             stream_with_context(odk_response.iter_content(chunk_size=8192)),
             content_type=odk_response.headers.get("Content-Type")
         )
+
     except Exception as e:
         print(f"💥 Proxy Layer Execution Failure: {e}")
-        return jsonify({"error": "Proxy Error", "details": str(e)}), 500
+        return jsonify({"error": "Proxy Error Layer", "details": str(e)}), 500
         
 if __name__ == "__main__":
     # Ensure production cache table space exists on init
