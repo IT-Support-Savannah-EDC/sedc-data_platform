@@ -85,9 +85,12 @@ def get_smart_master_clock(dataset_name):
         ''')
         
         with engine.connect() as conn:
-            res = conn.execute(query).scalar()
-            if res and res[0] is not None:
-                return pd.Timestamp(res[0]).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            max_val = conn.execute(query).scalar()
+            
+            if max_val:
+                if isinstance(max_val, pd.Timestamp):
+                    return max_val.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                return str(max_val)
     except Exception as e:
         logger.warning(f"⚠️ Could not read clock from {target_schema}.{refined_table}: {e}")
     return None
