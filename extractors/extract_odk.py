@@ -108,7 +108,7 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
         current_params['$skip'] = skip
         
         logger.info(f"📡 Downloading API chunk: records {skip} to {skip+top}...")
-        response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", params=current_params)
+        response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", timeout=10, params=current_params)
         response.raise_for_status()
         
         data = response.json().get('value', [])
@@ -123,9 +123,16 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
         skip += top
 
 def discover_datasets(project_id):
-    response = client.get(f"projects/{project_id}/datasets")
-    response.raise_for_status()
-    return [ds['name'] for ds in response.json()]
+    logger.info("🔒 Attempting to connect to ODK Central and fetch datasets...")
+    
+    # pyodk client accepts standard requests keyword args like timeout
+    try:
+        response = client.get(f"projects/{project_id}/datasets", timeout=10)
+        response.raise_for_status()
+        return [ds['name'] for ds in response.json()]
+    except Exception as err:
+        logger.error(f"❌ Network connection failed while hitting ODK Central: {err}")
+        raise err
 
 def upsert_raw_data(df, table_name, conflict_key="__id"):
     if df.empty: return 0
