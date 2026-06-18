@@ -48,6 +48,33 @@ def clean_and_vectorize_media(df, dataset_name):
             )
     return df
 
+def sync_staging_schema(engine, df, staging_table, conflict_key):
+    """Ensures staging table exists and automatically adds new columns."""
+    target_schema = "data_staging"
+    with engine.connect() as conn:
+        exists_query = text("SELECT exists (SELECT FROM pg_tables WHERE schemaname = :s AND tablename = :t)")
+        exists = conn.execute(exists_query, {"s": target_schema, "t": staging_table}).scalar()
+
+    # 1. Base table creation if it does not exist
+    if not exists:
+        logger.info(f"✨ Target table {target_schema}.{staging_table} missing. Building structure...")
+        df.head(0).to_sql(staging_table, engine, schema=target_schema, if_exists='replace', index=False)
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{staging_table}_idx" ON "{target_schema}"."{staging_table}" ("{conflict_key}");'))
+        return
+
+    # 2. Schema Evolution
+    with engine.connect() as conn:
+        query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = :t")
+        existing_cols = {row[0] for row in conn.execute(query, {"s": target_schema, "t": staging_table}).fetchall()}
+
+    new_cols = [col for col in df.columns if col not in existing_cols]
+    if new_cols:
+        logger.info(f"🧬 Schema Evolution: Adding {len(new_cols)} columns to {target_schema}.{staging_table}")
+        with engine.begin() as transaction_conn:
+            for col in new_cols:
+                transaction_conn.execute(text(f'ALTER TABLE "{target_schema}"."{staging_table}" ADD COLUMN "{col}" TEXT'))
+
 def upsert_to_staging(df, table_name, chunk_idx):
     if df.empty:
         return
@@ -59,6 +86,9 @@ def upsert_to_staging(df, table_name, chunk_idx):
     if not conflict_key:
         logger.error(f"❌ Aborting upsert for {table_name}: No valid conflict key.")
         return
+
+    # Synchronize schema to allow dynamic column additions (e.g. proxy URLs)
+    sync_staging_schema(engine, df, staging_table, conflict_key)
 
     logger.info(f"🔄 Committing chunk {chunk_idx} to data_staging.{staging_table} ({len(df)} rows)...")
     
@@ -88,7 +118,7 @@ def clear_raw_table(engine, raw_table_name):
     logger.info(f"✨ [PURGE SUCCESS] data_raw.\"{raw_table_name}\" has been emptied cleanly.")
 
 def run_cleaning_pipeline():
-    logger.info("🎬 Starting Staging Cleaning Pipeline...")
+    logger.info("🎬 [Phase 2/3] Starting Staging Cleaning Pipeline...")
     raw_tables = discover_raw_tables()
     engine = get_engine()
     
@@ -125,10 +155,10 @@ def run_cleaning_pipeline():
             )
             raise table_error
             
-    logger.info("🏁 Cleaning Pipeline Operations Completed.")
+    logger.info("🏁 [Phase 2/3] Cleaning Pipeline Operations Completed. Handoff to Loader...")
 
 if __name__ == "__main__":
     try:
         run_cleaning_pipeline()
     except Exception as e:
-        logger.critical(f"💥 Staging pipeline halted: {e}", exc_info=True)
+        logger.critical(f"💥 [Phase 2/3] Staging pipeline halted: {e}", exc_info=True)
