@@ -102,3 +102,9 @@ def run_cleaning_pipeline():
             upsert_to_staging(df_cleaned, clean_dataset_name)
             
     logger.info("✅ Cleaning Pipeline Operations Completed.")
+
+if __name__ == "__main__":
+    try:
+        run_cleaning_pipeline()
+    except Exception as e:
+        logger.critical(f"💥 Staging pipeline halted: {e}", exc_info=True)
