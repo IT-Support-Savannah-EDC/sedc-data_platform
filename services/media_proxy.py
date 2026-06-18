@@ -79,39 +79,38 @@ def discover_lineage(dataset_name, entity_id, filename):
 @app.route("/media/<dataset_name>/<entity_id>/<filename>", methods=["GET"])
 def proxy_media(dataset_name, entity_id, filename):
     try:
-        # Resolve where this file lives in ODK Central
+        # 1. Resolve lineage from cache or API
         form_id, submission_uuid = discover_lineage(dataset_name, entity_id, filename)
         
-        # Strip out any 'uuid:' prefix if attached to form data
-        clean_uuid = submission_uuid.replace("uuid:", "")
-
-        # CRITICAL: Filenames must be URL encoded to prevent 404s on files with spaces or special chars
-        safe_filename = quote(filename) 
+        # 2. Clean and URL-encode parameters safely
+        clean_uuid = submission_uuid.replace("uuid:", "").strip()
+        safe_filename = quote(filename.strip())
+        safe_form_id = quote(form_id.strip())
         
-        # Ensure form_id is also safe for URL usage
-        safe_form_id = quote(form_id)
-        
+        # Construct the target endpoint
         binary_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{safe_filename}"
         
-        # Stream the attachment down from ODK Central token-authenticated
-        token = client.session.headers.get("Authorization")
-        odk_response = requests.get(binary_url, headers={"Authorization": token}, stream=True)
+        print(f"📡 [PROXY STREAM] Fetching asset via pyodk session from: {binary_url}")
         
-        if odk_response.status_code == 404:
-            print(f"❌ 404 Found at: {binary_url}")
-            return Response(f"ODK Central Asset Stream Error: 404. Path not found.", status=404)
+        # 3. FIX: Use client.session instead of requests.get to inherit pristine auth states
+        # stream=True keeps memory footprints tiny
+        odk_response = client.session.get(binary_url, stream=True)
         
         if odk_response.status_code != 200:
+            print(f"❌ ODK Central responded with status {odk_response.status_code}")
+            print(f"📝 Response Body context: {odk_response.text[:200]}") # Log first 200 chars of the error
             return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=502)
             
+        # 4. Deliver chunked response stream directly to browser
         return Response(
             stream_with_context(odk_response.iter_content(chunk_size=8192)),
             content_type=odk_response.headers.get("Content-Type")
         )
 
     except Exception as e:
+        print(f"💥 Proxy Layer Execution Failure: {e}")
         return jsonify({"error": "Proxy Error Layer", "details": str(e)}), 500
-
+        
 if __name__ == "__main__":
     # Ensure production cache table space exists on init
     with engine.begin() as init_conn:
