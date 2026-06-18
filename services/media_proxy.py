@@ -79,29 +79,28 @@ def discover_lineage(dataset_name, entity_id, filename):
 @app.route("/media/<dataset_name>/<entity_id>/<filename>", methods=["GET"])
 def proxy_media(dataset_name, entity_id, filename):
     try:
-        # 1. Pull lineage values confidently from your validated DB Cache
-        form_id, submission_uuid = discover_lineage(dataset_name, entity_id, filename.strip())
-        
-        # Clean metadata strings precisely
-        clean_uuid = submission_uuid.replace("uuid:", "").strip()
-        safe_form_id = form_id.strip()
         safe_filename = filename.strip()
-
-        # 2. Build explicit relative URL matching ODK Central API specs
-        # pyodk automatically adds base URL prefixing (https://.../v1/)
-        relative_path = f"projects/{PROJECT_ID}/forms/{quote(safe_form_id)}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
         
-        print(f"📡 [PROXY STREAMING] Forwarding path via pyodk:\n    👉 {relative_path}")
-        odk_response = client.session.get(relative_path, stream=True)
+        # 1. Resolve submission lineage using your verified DB cache
+        form_id, submission_uuid = discover_lineage(dataset_name, entity_id, safe_filename)
+        clean_uuid = submission_uuid.replace("uuid:", "").strip()
 
-        # 3. Fallback to unquoted form ID route if ODK returns a 404
+        # 2. Strategy 1: Project-Level Global Submission Endpoint (Bypasses Form Versioning 404 traps)
+        # Path: projects/{projectId}/submissions/{instanceId}/attachments/{filename}
+        project_sub_path = f"projects/{PROJECT_ID}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
+        print(f"📡 [TRY 1] Fetching global project-level submission asset:\n    👉 {project_sub_path}")
+        odk_response = client.session.get(project_sub_path, stream=True)
+
+        # 3. Strategy 2: Fallback to Form-Scoped path if Project-scoped path isn't supported by your version
         if odk_response.status_code == 404:
-            alt_path = f"projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
-            print(f"🔄 [FALLBACK TRY] Trying unquoted form path:\n    👉 {alt_path}")
-            odk_response = client.session.get(alt_path, stream=True)
+            print("🔄 [TRY 2 - FALLBACK] Global route 404ed. Attempting form-scoped path...")
+            safe_form_id = form_id.strip()
+            form_sub_path = f"projects/{PROJECT_ID}/forms/{quote(safe_form_id)}/submissions/{clean_uuid}/attachments/{quote(safe_filename)}"
+            odk_response = client.session.get(form_sub_path, stream=True)
 
+        # Evaluate final response status from ODK Central
         if odk_response.status_code != 200:
-            print(f"❌ ODK Server rejected request with status code: {odk_response.status_code}")
+            print(f"❌ ODK Server rejected streaming request with status code: {odk_response.status_code}")
             return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=odk_response.status_code)
             
         return Response(
