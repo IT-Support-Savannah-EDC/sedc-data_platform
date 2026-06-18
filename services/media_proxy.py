@@ -5,6 +5,7 @@ from flask import Flask, Response, stream_with_context, jsonify
 from sqlalchemy import create_engine, text
 from pyodk.client import Client
 from dotenv import load_dotenv
+from requests.utils import quote
 
 env_path = Path('/opt/data_platform/config/.env')
 load_dotenv(dotenv_path=env_path)
@@ -83,16 +84,26 @@ def proxy_media(dataset_name, entity_id, filename):
         
         # Strip out any 'uuid:' prefix if attached to form data
         clean_uuid = submission_uuid.replace("uuid:", "")
-        binary_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{form_id}/submissions/{clean_uuid}/attachments/{filename}"
+
+        # CRITICAL: Filenames must be URL encoded to prevent 404s on files with spaces or special chars
+        safe_filename = quote(filename) 
+        
+        # Ensure form_id is also safe for URL usage
+        safe_form_id = quote(form_id)
+        
+        binary_url = f"{BASE_ODK_URL}/projects/{PROJECT_ID}/forms/{safe_form_id}/submissions/{clean_uuid}/attachments/{safe_filename}"
         
         # Stream the attachment down from ODK Central token-authenticated
         token = client.session.headers.get("Authorization")
         odk_response = requests.get(binary_url, headers={"Authorization": token}, stream=True)
         
+        if odk_response.status_code == 404:
+            print(f"❌ 404 Found at: {binary_url}")
+            return Response(f"ODK Central Asset Stream Error: 404. Path not found.", status=404)
+        
         if odk_response.status_code != 200:
             return Response(f"ODK Central Asset Stream Error: {odk_response.status_code}", status=502)
             
-        # Deliver chunked response stream directly to browser
         return Response(
             stream_with_context(odk_response.iter_content(chunk_size=8192)),
             content_type=odk_response.headers.get("Content-Type")
