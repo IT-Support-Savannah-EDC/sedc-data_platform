@@ -189,10 +189,11 @@ def sync_dataset_raw(dataset_name, project_id):
 
 if __name__ == "__main__":
     try:
-        logger.info("🎬 Initializing High-Performance Paginated Extractor...")
+        logger.info("🎬 [Phase 1/3] Initializing High-Performance Paginated Extractor...")
         for dataset in discover_datasets(PROJECT_ID):
             sync_dataset_raw(dataset, PROJECT_ID)
+        logger.info("🏁 [Phase 1/3] Extraction Operations Completed. Handoff to Cleaner...")
     except Exception as e:
-        logger.critical(f"💥 Ingestion engine halted: {e}", exc_info=True)
+        logger.critical(f"💥 [Phase 1/3] Ingestion engine halted: {e}", exc_info=True)
     finally:
         engine.dispose()
