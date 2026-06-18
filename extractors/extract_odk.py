@@ -78,9 +78,7 @@ def get_smart_master_clock(dataset_name):
     try: 
         # This allows Postgres to use indexes and execute instantly.
         query = text(f'''
-            SELECT 
-                MAX("__system_updatedAt") as max_up, 
-                MAX("__system_createdAt") as max_cr 
+            SELECT MAX(COALESCE("__system_updatedAt", "__system_createdAt")) 
             FROM "{target_schema}"."{target_table}";
         ''')
         
