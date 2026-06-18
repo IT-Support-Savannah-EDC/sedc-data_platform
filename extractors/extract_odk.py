@@ -166,13 +166,16 @@ def sync_dataset_raw(dataset_name, project_id):
             continue
             
         df = pd.json_normalize(page_records, sep='_')
-
+        
+        # FIX: Handle ODK ignoring filters by strictly dropping stale data client-side
         if last_update and '__system_updatedAt' in df.columns:
+            # Convert to string or datetime to compare with last_update string safely
+            # Dropping anything that is less than or equal to our last known high-water mark
             df = df[df['__system_updatedAt'] > last_update]
-
+            
         if df.empty:
             continue
-
+        
         # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
         for col in df.columns:
             if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
@@ -182,7 +185,7 @@ def sync_dataset_raw(dataset_name, project_id):
         total_written += count
         
     if total_written > 0:
-        logger.info(f"✅ Securely committed {total_written} records to {TARGET_SCHEMA}.{db_table_name}")
+        logger.info(f"✅ Securely committed {total_written} new/updated records to {TARGET_SCHEMA}.{db_table_name}")
     else:
         logger.info(f"⏸️ No delta updates found for '{dataset_name}'.")
 
