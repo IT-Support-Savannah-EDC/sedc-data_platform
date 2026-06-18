@@ -84,6 +84,9 @@ def run_cleaning_pipeline():
     
     for raw_table in raw_tables:
         if raw_table.startswith('temp_'): continue
+
+        # Define the variable first (e.g., stripping prefixes like 'entity_')
+        clean_dataset_name = raw_table.replace('entity_', '')
             
         if clean_dataset_name == "staff_register":
             clean_dataset_name = "Staff_Register"
