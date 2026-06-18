@@ -60,7 +60,6 @@ def upsert_to_staging(df, table_name, chunk_idx):
         logger.error(f"❌ Aborting upsert for {table_name}: No valid conflict key.")
         return
 
-    # Transactional Log
     logger.info(f"🔄 Committing chunk {chunk_idx} to data_staging.{staging_table} ({len(df)} rows)...")
     
     temp_holder = f"temp_{staging_table}_{chunk_idx}_{int(pd.Timestamp.now().timestamp())}"
@@ -78,27 +77,53 @@ def upsert_to_staging(df, table_name, chunk_idx):
         conn.execute(text(f'DROP TABLE IF EXISTS "{temp_holder}"'))
     logger.info(f"✅ Chunk {chunk_idx} committed successfully.")
 
+def clear_raw_table(engine, raw_table_name):
+    """
+    Safely purges data from the raw landing table after successful staging ingestion.
+    """
+    logger.info(f"🧹 [PURGE] Initiating safe clear for data_raw.\"{raw_table_name}\"...")
+    with engine.begin() as conn:
+        # TRUNCATE is faster and cleaner than DELETE for resetting ETL landing tables
+        conn.execute(text(f'TRUNCATE TABLE data_raw."{raw_table_name}" RESTART IDENTITY;'))
+    logger.info(f"✨ [PURGE SUCCESS] data_raw.\"{raw_table_name}\" has been emptied cleanly.")
+
 def run_cleaning_pipeline():
     logger.info("🎬 Starting Staging Cleaning Pipeline...")
     raw_tables = discover_raw_tables()
+    engine = get_engine()
     
     for raw_table in raw_tables:
-        if raw_table.startswith('temp_'): continue
+        if raw_table.startswith('temp_'): 
+            continue
 
-        # Define the variable first (e.g., stripping prefixes like 'entity_')
         clean_dataset_name = raw_table.replace('entity_', '')
-            
         if clean_dataset_name == "staff_register":
             clean_dataset_name = "Staff_Register"
-        engine = get_engine()
         
         chunk_idx = 0
-        for chunk_df in pd.read_sql_table(raw_table, con=engine, schema='data_raw', chunksize=2500):
-            chunk_idx += 1
-            logger.info(f"📦 Processing {raw_table} [Chunk {chunk_idx}]...")
+        try:
+            # Process table in chunks sequentially
+            for chunk_df in pd.read_sql_table(raw_table, con=engine, schema='data_raw', chunksize=2500):
+                chunk_idx += 1
+                logger.info(f"📦 Processing {raw_table} [Chunk {chunk_idx}]...")
+                
+                df_cleaned = clean_and_vectorize_media(chunk_df, clean_dataset_name)
+                upsert_to_staging(df_cleaned, clean_dataset_name, chunk_idx)
             
-            df_cleaned = clean_and_vectorize_media(chunk_df, clean_dataset_name)
-            upsert_to_staging(df_cleaned, clean_dataset_name, chunk_idx)
+            # --- SAFE CLEARANCE ZONE ---
+            # If the loop naturally finishes without raising an Exception, we proceed to purge.
+            if chunk_idx > 0:
+                clear_raw_table(engine, raw_table)
+            else:
+                logger.info(f"ℹ️ Table data_raw.\"{raw_table}\" was empty. No data clearance required.")
+
+        except Exception as table_error:
+            # Catch failures at the individual table level to prevent catastrophic drops
+            logger.error(
+                f"❌ [DATA PROTECTION] Critical failure processing table data_raw.\"{raw_table}\" on chunk {chunk_idx}. "
+                f"Purge operation aborted to prevent data loss. Error: {table_error}"
+            )
+            raise table_error
             
     logger.info("🏁 Cleaning Pipeline Operations Completed.")
 
