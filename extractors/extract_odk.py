@@ -162,8 +162,17 @@ def sync_dataset_raw(dataset_name, project_id):
     total_written = 0
     # Process the data in strict memory-safe pages
     for page_records in fetch_entities_paginated(project_id, dataset_name, params=params):
+        if not page_records:
+            continue
+            
         df = pd.json_normalize(page_records, sep='_')
-        
+
+        if last_update and '__system_updatedAt' in df.columns:
+            df = df[df['__system_updatedAt'] > last_update]
+
+        if df.empty:
+            continue
+
         # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
         for col in df.columns:
             if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
