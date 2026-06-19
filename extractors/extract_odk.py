@@ -53,11 +53,6 @@ def sync_schema(df, table_name):
                 transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
 
 def get_smart_master_clock(dataset_name):
-    # --- TEMPORARY INVESTIGATION BYPASS ---
-    if dataset_name.lower() == "staff_register":
-        logger.warning(f"⚠️ INVESTIGATION MODE: Bypassing clock for '{dataset_name}' to pull all history!")
-        return None
-    
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
 
@@ -70,18 +65,15 @@ def get_smart_master_clock(dataset_name):
     if inspector.has_table(refined_table, schema="data_refined"):
         target_schema = "data_refined"
         target_table = refined_table
-
     # Priority 2
     elif inspector.has_table(raw_table, schema="data_raw"):
         target_schema = "data_raw"
         target_table = raw_table
-        
     # Priority 3
     else:
         return None
         
     try: 
-        # This allows Postgres to use indexes and execute instantly.
         query = text(f'''
             SELECT MAX(COALESCE("__system_updatedAt", "__system_createdAt")) 
             FROM "{target_schema}"."{target_table}";
@@ -89,7 +81,6 @@ def get_smart_master_clock(dataset_name):
         
         with engine.connect() as conn:
             max_val = conn.execute(query).scalar()
-            
             if max_val:
                 if isinstance(max_val, pd.Timestamp):
                     return max_val.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
@@ -98,11 +89,27 @@ def get_smart_master_clock(dataset_name):
         logger.warning(f"⚠️ Could not read clock from {target_schema}.{refined_table}: {e}")
     return None
 
+def discover_forms(project_id):
+    logger.info("🔒 Fetching all active Forms from ODK Central...")
+    try:
+        response = client.get(f"projects/{project_id}/forms", timeout=10)
+        response.raise_for_status()
+        return [form['xmlFormId'] for form in response.json()]
+    except Exception as err:
+        logger.error(f"❌ Failed to discover forms from ODK Central: {err}")
+        raise err
+
+def discover_datasets(project_id):
+    logger.info("🔒 Attempting to connect to ODK Central and fetch datasets...")
+    try:
+        response = client.get(f"projects/{project_id}/datasets", timeout=10)
+        response.raise_for_status()
+        return [ds['name'] for ds in response.json()]
+    except Exception as err:
+        logger.error(f"❌ Network connection failed while hitting ODK Central: {err}")
+        raise err
+
 def fetch_entities_paginated(project_id, dataset_name, params=None):
-    """
-    FIX: Prevents OOM crashes by strictly paginating the API call.
-    Yields data in safe 2,000-record chunks.
-    """
     if params is None: params = {}
     skip = 0
     top = 2000  
@@ -112,7 +119,7 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
         current_params['$top'] = top
         current_params['$skip'] = skip
         
-        logger.info(f"📡 Downloading API chunk: records {skip} to {skip+top}...")
+        logger.info(f"📡 Downloading Dataset API chunk: records {skip} to {skip+top}...")
         response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", timeout=10, params=current_params)
         response.raise_for_status()
         
@@ -121,23 +128,32 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
             break
             
         yield data
-        
         if len(data) < top:
             break 
-            
         skip += top
 
-def discover_datasets(project_id):
-    logger.info("🔒 Attempting to connect to ODK Central and fetch datasets...")
+def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=None):
+    if params is None: params = {}
+    skip = 0
+    top = 2000
     
-    # pyodk client accepts standard requests keyword args like timeout
-    try:
-        response = client.get(f"projects/{project_id}/datasets", timeout=10)
+    while True:
+        current_params = params.copy()
+        current_params['$top'] = top
+        current_params['$skip'] = skip
+        
+        logger.info(f"📡 Downloading Form ({form_id}) OData chunk for '{table_endpoint}': records {skip} to {skip+top}...")
+        response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=15, params=current_params)
         response.raise_for_status()
-        return [ds['name'] for ds in response.json()]
-    except Exception as err:
-        logger.error(f"❌ Network connection failed while hitting ODK Central: {err}")
-        raise err
+        
+        data = response.json().get('value', [])
+        if not data:
+            break
+            
+        yield data
+        if len(data) < top:
+            break
+        skip += top
 
 def upsert_raw_data(df, table_name, conflict_key="__id"):
     if df.empty: return 0
@@ -145,7 +161,6 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
     sync_schema(df, table_name)
     
-    # FIX: Everything now happens strictly inside ONE connection context to prevent table leaks
     with engine.begin() as conn:
         try:
             conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
@@ -156,10 +171,73 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
             update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
             conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
         finally:
-            # Drop command stays inside the same transaction
             conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
             
     return len(df)
+
+def sync_form_raw(form_id, project_id):
+    base_name = form_id.replace('-', '_').replace(' ', '_').lower()
+    main_table_name = f"form_{base_name}_main"
+    
+    inspector = inspect(engine)
+    last_update = None
+    
+    if inspector.has_table(main_table_name, schema=TARGET_SCHEMA):
+        try:
+            query = text(f'SELECT MAX("__system_submissiondate") FROM "{TARGET_SCHEMA}"."{main_table_name}"')
+            with engine.connect() as conn:
+                max_val = conn.execute(query).scalar()
+                if max_val:
+                    last_update = pd.to_datetime(max_val)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not read clock from form table {main_table_name}: {e}")
+
+    params = {}
+    if last_update:
+        buffered_time = last_update - pd.Timedelta(minutes=5)
+        iso_timestamp = buffered_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        params["$filter"] = f"(__system/submissionDate gt {iso_timestamp}) or (__system/updatedAt gt {iso_timestamp})"
+        logger.info(f"📡 Applying Form OData filter with 5-minute rolling safety buffer: {params['$filter']}")
+    else:
+        logger.info(f"📡 Initiating full baseline synchronization for Form '{form_id}'.")
+
+    try:
+        svc_response = client.get(f"projects/{project_id}/forms/{form_id}.svc", timeout=10)
+        svc_response.raise_for_status()
+        tables = [table["url"] for table in svc_response.json().get("value", [])]
+    except Exception as e:
+        logger.error(f"❌ Failed to retrieve OData service document structure for Form {form_id}: {e}")
+        return
+
+    for table_endpoint in tables:
+        if table_endpoint == "Submissions":
+            db_table_name = main_table_name
+        else:
+            clean_suffix = table_endpoint.replace("Submissions.", "").replace(".", "_").lower()
+            db_table_name = f"form_{base_name}_{clean_suffix}"
+
+        total_written = 0
+        for page_records in fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=params):
+            if not page_records:
+                continue
+
+            df = pd.json_normalize(page_records, sep='_')
+            df.columns = [col.replace('-', '_').replace('__', '_').lower().strip() for col in df.columns]
+
+            for col in df.columns:
+                if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                    df[col] = df[col].astype(str)
+
+            conflict_key = "__id" if "__id" in df.columns else "id" if "id" in df.columns else None
+            if not conflict_key:
+                id_cols = [c for c in df.columns if 'id' in c]
+                conflict_key = id_cols[0] if id_cols else df.columns[0]
+
+            count = upsert_raw_data(df, db_table_name, conflict_key=conflict_key)
+            total_written += count
+
+        if total_written > 0:
+            logger.info(f"✅ Securely committed {total_written} records to {TARGET_SCHEMA}.{db_table_name}")
 
 def sync_dataset_raw(dataset_name, project_id):
     base_name = dataset_name.replace(' ', '_').lower()
@@ -167,91 +245,39 @@ def sync_dataset_raw(dataset_name, project_id):
     db_table_name = f"entity_{base_name}"
     
     last_update = get_smart_master_clock(dataset_name)
-    params = {"$filter": f"__system/updatedAt gt {last_update}"} if last_update else {}
+    
+    params = {}
+    if last_update:
+        try:
+            buffer_time = pd.to_datetime(last_update) - pd.Timedelta(minutes=5)
+            last_update_buffered = buffer_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            params = {"$filter": f"__system/updatedAt gt {last_update_buffered}"}
+            logger.info(f"📡 Requesting dataset deltas with 5-minute rolling safety buffer: {params['$filter']}")
+        except Exception as e:
+            params = {"$filter": f"__system/updatedAt gt {last_update}"}
+    else:
+        logger.info(f"📡 Requesting full baseline dataset download.")
     
     total_written = 0
-    # Process the data in strict memory-safe pages
     for page_records in fetch_entities_paginated(project_id, dataset_name, params=params):
         if not page_records:
             continue
             
-       # Convert all hyphens to underscores in the raw data keys first
-        # This fixes the Metabase subtraction/math error and matching bugs
-        cleaned_records = []
-        for record in page_records:
-            # Deep string replacement of hyphens to underscores in JSON keys
-            record_str = str(record).replace("'", '"') # basic sanitization if needed
-            # A safer approach is a recursive function, but cleaning the DataFrame or unpacking works best:
-            cleaned_records.append(record)
-
         df = pd.json_normalize(page_records, sep='_')
 
-        # 🔍 DIAGNOSTIC: Print out the first 10 columns to see if 'properties_' is there
-        logger.info(f"📋 First 10 Raw DataFrame columns for '{dataset_name}': {list(df.columns)[:10]}")
-        
-        # Standardize columns to lowercase and underscores right away
-        # Standardize columns to lowercase, underscores, and strip the ODK entity prefix
         cleaned_cols = []
         for col in df.columns:
-            # Remove the ODK entity container prefix if present
             new_col = col.replace('properties_', '')
-            # Replace hyphens with underscores and clean it up
             new_col = new_col.replace('-', '_').lower().strip()
             cleaned_cols.append(new_col)
-            
         df.columns = cleaned_cols
 
-        # --- REPEAT GROUP HANDLING FOR METER INSTALLATION ---
-        # If this is the meter installation table and the repeat nested key exists
-        if db_table_name == "entity_meter_installation":
-            # Identify the column holding the media and installation arrays
-            # Often named something like 'all_metering_group_installation' or similar based on your XLSForm
-            possible_repeat_cols = [c for c in df.columns if 'installation' in c or 'group' in c]
-            logger.info(f"🔎 Found potential nested repeat groups columns: {possible_repeat_cols}")
-            
-            # If your intention is to flatten them inline (assuming 1 repeat item per form):
-            # We can unpack the list dictionaries directly into columns
-            for col in df.columns:
-                if df[col].apply(lambda x: isinstance(x, list)).any():
-                    logger.info(f"💥 Unpacking nested array column: {col}")
-                    # Explode the list so it creates separate rows or objects
-                    # For a single installation block per record, we can extract item 0:
-                    df_unpacked = pd.json_normalize(df[col].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else {}))
-                    df_unpacked.columns = [f"{col}_{sub_c}".replace('-', '_').lower() for sub_c in df_unpacked.columns]
-                    df = pd.concat([df.drop(columns=[col]), df_unpacked], axis=1)
-        # -----------------------------------------------------
-
-        # FIX: Handle ODK ignoring filters by strictly dropping stale data client-side
         if last_update and '__system_updatedat' in df.columns:
-            # Convert to string or datetime to compare with last_update string safely
-            # Dropping anything that is less than or equal to our last known high-water mark
             df = df[df['__system_updatedat'] > last_update]
             
         if df.empty:
             continue
         
-        # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
-        for col in df.columns:
-            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                df[col] = df[col].astype(str)
-
-        # --- DIAGNOSTIC BLOCK: CHECKING FOR MEDIA DATA ---
-        media_cols = [c for c in df.columns if 'picture' in c or 'video' in c]
-        if media_cols:
-            logger.info(f"📸 Scanning {len(media_cols)} media columns in this chunk...")
-            found_any = False
-            for mc in media_cols:
-                # Filter out nulls, NaNs, and empty strings
-                valid_data = df[df[mc].notna() & (df[mc] != '') & (df[mc].astype(str).str.lower() != 'nan')][mc].tolist()
-                if valid_data:
-                    logger.info(f"✅ Data found in '{mc}': {valid_data[:3]}...")
-                    found_any = True
-            
-            if not found_any:
-                logger.warning("⚠️ All media columns in these recent delta records are completely empty/null.")
-        # -------------------------------------------------
-
-        # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
         for col in df.columns:
             if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
                 df[col] = df[col].astype(str)
@@ -262,13 +288,28 @@ def sync_dataset_raw(dataset_name, project_id):
     if total_written > 0:
         logger.info(f"✅ Securely committed {total_written} new/updated records to {TARGET_SCHEMA}.{db_table_name}")
     else:
-        logger.info(f"⏸️ No delta updates found for '{dataset_name}'.")
+        logger.info(f"⏸️ No delta updates found for dataset '{dataset_name}'.")
 
 if __name__ == "__main__":
     try:
         logger.info("🎬 [Phase 1/3] Initializing High-Performance Paginated Extractor...")
+        
+        # 1. Relational Form Sync Pipeline (Extracts comprehensive structural repeat groups safely)
+        logger.info("--- STARTING FORM EXTRACTION (RELATIONAL REPEATS) ---")
+        for form in discover_forms(PROJECT_ID):
+            try:
+                sync_form_raw(form, PROJECT_ID)
+            except Exception as e:
+                logger.error(f"❌ Synchronization failed for Form '{form}': {e}", exc_info=True)
+        
+        # 2. Stateful Entity Dataset Sync Pipeline
+        logger.info("--- STARTING DATASET EXTRACTION ---")
         for dataset in discover_datasets(PROJECT_ID):
-            sync_dataset_raw(dataset, PROJECT_ID)
+            try:
+                sync_dataset_raw(dataset, PROJECT_ID)
+            except Exception as e:
+                logger.error(f"❌ Synchronization failed for Dataset '{dataset}': {e}", exc_info=True)
+                
         logger.info("🏁 [Phase 1/3] Extraction Operations Completed. Handoff to Cleaner...")
     except Exception as e:
         logger.critical(f"💥 [Phase 1/3] Ingestion engine halted: {e}", exc_info=True)
