@@ -185,6 +185,10 @@ def sync_dataset_raw(dataset_name, project_id):
             cleaned_records.append(record)
 
         df = pd.json_normalize(page_records, sep='_')
+
+        # 🔍 DIAGNOSTIC: Print out the first 10 columns to see if 'properties_' is there
+        logger.info(f"📋 First 10 Raw DataFrame columns for '{dataset_name}': {list(df.columns)[:10]}")
+        
         # Standardize columns to lowercase and underscores right away
         df.columns = [c.replace('-', '_').lower().strip() for c in df.columns]
 
