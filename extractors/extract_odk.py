@@ -52,43 +52,91 @@ def sync_schema(df, table_name):
             for col in new_cols:
                 transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
 
-def get_smart_master_clock(dataset_name):
-    base_name = dataset_name.replace(' ', '_').lower()
-    if base_name == "customers_db": base_name = "customer_db"
+@retry_db
+def get_smart_master_clock(name, sync_type="dataset"):
+    """
+    The Smart Master Clock.
+    Dynamically scans 'data_refined' (Priority 1) and 'data_raw' (Priority 2) schemas
+    to find the most recent record timestamp for either a Form or a Dataset.
+    Resolves column names dynamically to prevent database casing exceptions.
+    """
+    # Normalize the base name to match database conventions
+    base_name = name.replace(' ', '_').replace('-', '_').lower()
+    if base_name == "customers_db": 
+        base_name = "customer_db"
 
-    raw_table = f"entity_{base_name}"
-    refined_table = base_name
-    
+    # 1. Dynamically resolve table name candidates based on type
+    if sync_type == "form":
+        refined_candidates = [base_name, f"form_{base_name}"]
+        raw_candidates = [f"form_{base_name}_main", f"{base_name}_main", f"form_{base_name}", base_name]
+    else:  # dataset
+        refined_candidates = [base_name, f"entity_{base_name}"]
+        raw_candidates = [f"entity_{base_name}", base_name]
+
     inspector = inspect(engine)
+    target_schema = None
+    target_table = None
 
-    # Priority 1
-    if inspector.has_table(refined_table, schema="data_refined"):
-        target_schema = "data_refined"
-        target_table = refined_table
-    # Priority 2
-    elif inspector.has_table(raw_table, schema="data_raw"):
-        target_schema = "data_raw"
-        target_table = raw_table
-    # Priority 3
-    else:
+    # Priority 1: Scan 'data_refined'
+    for table_cand in refined_candidates:
+        if inspector.has_table(table_cand, schema="data_refined"):
+            target_schema = "data_refined"
+            target_table = table_cand
+            break
+
+    # Priority 2: Fall back to scan 'data_raw'
+    if not target_schema:
+        for table_cand in raw_candidates:
+            if inspector.has_table(table_cand, schema="data_raw"):
+                target_schema = "data_raw"
+                target_table = table_cand
+                break
+
+    # If no table exists yet in either schema, trigger a clean full extract
+    if not target_schema or not target_table:
+        logger.debug(f"⏰ No tracking table found for {sync_type} '{name}' in data_refined/data_raw. Performing full baseline extraction.")
         return None
-        
-    try: 
-        query = text(f'''
-            SELECT MAX(COALESCE("__system_updatedAt", "__system_createdAt")) 
-            FROM "{target_schema}"."{target_table}";
-        ''')
-        
-        with engine.connect() as conn:
-            max_val = conn.execute(query).scalar()
-            if max_val:
-                if isinstance(max_val, pd.Timestamp):
-                    return max_val.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                return str(max_val)
-    except Exception as e:
-        logger.warning(f"⚠️ Could not read clock from {target_schema}.{refined_table}: {e}")
-    return None
 
+    try:
+        # 2. Dynamic Column Resolution: Query actual columns to avoid casing & missing-column crashes
+        existing_columns = [col['name'] for col in inspector.get_columns(target_table, schema=target_schema)]
+        existing_cols_lower = [c.lower() for c in existing_columns]
+        col_mapping = dict(zip(existing_cols_lower, existing_columns))
+
+        # Known time-tracking identifiers used across ODK forms and datasets
+        time_candidates = [
+            '__system_updatedat', '__system_submissiondate', '__system_createdat',
+            '__system.updatedat', '__system.submissiondate', '__system.createdat'
+        ]
+        
+        # Match only columns that strictly exist in this target table
+        matched_cols = [col_mapping[cand] for cand in time_candidates if cand in col_mapping]
+
+        if not matched_cols:
+            logger.warning(f"⚠️ No system time columns found in '{target_schema}'.'{target_table}'. Falling back to full extract.")
+            return None
+
+        # 3. Formulate dynamic SQL expression using GREATEST (Postgres safely ignores NULLs in GREATEST)
+        quoted_cols = [f'"{c}"' for c in matched_cols]
+        query_expr = quoted_cols[0] if len(quoted_cols) == 1 else f'GREATEST({", ".join(quoted_cols)})'
+        
+        query = text(f'SELECT MAX({query_expr}) FROM "{target_schema}"."{target_table}"')
+
+        with engine.connect() as conn:
+            result = conn.execute(query).scalar()
+            
+            if result:
+                # 4. Enforce strict UTC conversion to prevent OData protocol misalignments
+                ts = pd.to_datetime(result, utc=True)
+                iso_string = ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                logger.info(f"⏰ Smart Master Clock milestone for {sync_type} '{name}' ({target_schema}.{target_table}): {iso_string}")
+                return iso_string
+
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read Smart Master Clock from '{target_schema}'.'{target_table}': {e}. Falling back to full extract.")
+    
+    return None
+    
 def discover_forms(project_id):
     logger.info("🔒 Fetching all active Forms from ODK Central...")
     try:
