@@ -207,7 +207,7 @@ def sync_dataset_raw(dataset_name, project_id):
         if last_update and '__system_updatedat' in df.columns:
             # Convert to string or datetime to compare with last_update string safely
             # Dropping anything that is less than or equal to our last known high-water mark
-            df = df[df['__system_updatedAt'] > last_update]
+            df = df[df['__system_updatedat'] > last_update]
             
         if df.empty:
             continue
