@@ -241,12 +241,12 @@ def sync_form_raw(form_id, project_id):
     last_update_str = get_smart_master_clock(form_id, is_form=True)
     last_update = pd.to_datetime(last_update_str) if last_update_str else None
 
-    params = {}
+    base_params = {}
     if last_update:
         buffered_time = last_update - pd.Timedelta(minutes=5)
         iso_timestamp = buffered_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-        params["$filter"] = f"(__system/submissionDate gt {iso_timestamp}) or (__system/updatedAt gt {iso_timestamp})"
-        logger.info(f"📡 Applying Form OData filter with 5-minute rolling safety buffer: {params['$filter']}")
+        base_params["$filter"] = f"(__system/submissionDate gt {iso_timestamp}) or (__system/updatedAt gt {iso_timestamp})"
+        logger.info(f"📡 Applying Form OData filter with 5-minute rolling safety buffer: {base_params['$filter']}")
     else:
         logger.info(f"📡 Initiating full baseline synchronization for Form '{form_id}'.")
 
@@ -265,8 +265,15 @@ def sync_form_raw(form_id, project_id):
             clean_suffix = table_endpoint.replace("Submissions.", "").replace(".", "_").lower()
             db_table_name = f"form_{base_name}_{clean_suffix}"
 
+        # CRITICAL FIX: Isolate parameters for this endpoint loop and strip $filter for sub-tables.
+        # ODK Central does not support top-level __system/ metadata filters on relational repeat tables.
+        current_params = base_params.copy()
+        if table_endpoint != "Submissions" and "$filter" in current_params:
+            logger.debug(f"🧹 Scrubbing system metadata $filter parameter from sub-table query: {table_endpoint}")
+            current_params.pop("$filter", None)
+
         total_written = 0
-        for page_records in fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=params):
+        for page_records in fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=current_params):
             if not page_records:
                 continue
 
@@ -277,17 +284,30 @@ def sync_form_raw(form_id, project_id):
                 if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
                     df[col] = df[col].astype(str)
 
-            # Correctly target the primary key AFTER the columns have been stripped/cleaned
-            if "_id" in df.columns:
-                conflict_key = "_id"
-            elif "__id" in df.columns:
-                conflict_key = "__id"
-            elif "meta_instanceid" in df.columns:
-                conflict_key = "meta_instanceid"
+            # Determine the primary conflict key based on table depth
+            if table_endpoint == "Submissions":
+                # Top level unique keys mapping
+                if "_id" in df.columns:
+                    conflict_key = "_id"
+                elif "__id" in df.columns:
+                    conflict_key = "__id"
+                elif "meta_instanceid" in df.columns:
+                    conflict_key = "meta_instanceid"
+                else:
+                    id_cols = [c for c in df.columns if c.endswith('_id')]
+                    conflict_key = id_cols[0] if id_cols else df.columns[0]
             else:
-                # Absolute last resort fallback
-                id_cols = [c for c in df.columns if c.endswith('_id')]
-                conflict_key = id_cols[0] if id_cols else df.columns[0]
+                # CRITICAL FIX: Relational sub-tables (repeat groups) use a different primary key strategy.
+                # In nested structures, '_id' belongs to the parent row. The child rows have an internal row id or sequential ID.
+                # If an internal sub-table id column is missing, fall back safely to avoid creating constraints on parent key.
+                if "id" in df.columns:
+                    conflict_key = "id"
+                elif "subid" in df.columns:
+                    conflict_key = "subid"
+                else:
+                    # Look for columns matching sub-table keys instead of structural metadata
+                    non_meta_id_cols = [c for c in df.columns if c.endswith('id') and c != '_id']
+                    conflict_key = non_meta_id_cols[0] if non_meta_id_cols else df.columns[0]
 
             # Safely deduplicate the DataFrame *before* SQL insertion to prevent transient duplicates
             if conflict_key in df.columns:
