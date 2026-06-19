@@ -195,17 +195,21 @@ def upsert_raw_data(df, table_name, conflict_key="__id"):
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
     sync_schema(df, table_name)
     
+    # FIX: Native rollback handling. Let the context manager handle the aborts cleanly.
     with engine.begin() as conn:
-        try:
-            conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
-            df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
-            conn.execute(text(f'CREATE UNIQUE INDEX ON "{staging_table}" ("{conflict_key}");'))
-            
-            cols = [f'"{c}"' for c in df.columns]
-            update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
-            conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
-        finally:
-            conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
+        conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
+        df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
+        
+        # This will now safely target the actual '_id'
+        conn.execute(text(f'CREATE UNIQUE INDEX ON "{staging_table}" ("{conflict_key}");'))
+        
+        cols = [f'"{c}"' for c in df.columns]
+        update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
+        conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
+        
+        # If the above commands succeed, cleanly drop the temp table at the end of the transaction.
+        # If they fail, the transaction rolls back and Postgres auto-destroys the temp table.
+        conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
             
     return len(df)
 
@@ -253,10 +257,21 @@ def sync_form_raw(form_id, project_id):
                 if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
                     df[col] = df[col].astype(str)
 
-            conflict_key = "__id" if "__id" in df.columns else "id" if "id" in df.columns else None
-            if not conflict_key:
-                id_cols = [c for c in df.columns if 'id' in c]
+            # Correctly target the primary key AFTER the columns have been stripped/cleaned
+            if "_id" in df.columns:
+                conflict_key = "_id"
+            elif "__id" in df.columns:
+                conflict_key = "__id"
+            elif "meta_instanceid" in df.columns:
+                conflict_key = "meta_instanceid"
+            else:
+                # Absolute last resort fallback
+                id_cols = [c for c in df.columns if c.endswith('_id')]
                 conflict_key = id_cols[0] if id_cols else df.columns[0]
+
+            # Safely deduplicate the DataFrame *before* SQL insertion to prevent transient duplicates
+            if conflict_key in df.columns:
+                df = df.drop_duplicates(subset=[conflict_key], keep='last')
 
             count = upsert_raw_data(df, db_table_name, conflict_key=conflict_key)
             total_written += count
