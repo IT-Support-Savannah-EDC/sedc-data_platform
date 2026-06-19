@@ -190,7 +190,16 @@ def sync_dataset_raw(dataset_name, project_id):
         logger.info(f"📋 First 10 Raw DataFrame columns for '{dataset_name}': {list(df.columns)[:10]}")
         
         # Standardize columns to lowercase and underscores right away
-        df.columns = [c.replace('-', '_').lower().strip() for c in df.columns]
+        # Standardize columns to lowercase, underscores, and strip the ODK entity prefix
+        cleaned_cols = []
+        for col in df.columns:
+            # Remove the ODK entity container prefix if present
+            new_col = col.replace('properties_', '')
+            # Replace hyphens with underscores and clean it up
+            new_col = new_col.replace('-', '_').lower().strip()
+            cleaned_cols.append(new_col)
+            
+        df.columns = cleaned_cols
 
         # --- REPEAT GROUP HANDLING FOR METER INSTALLATION ---
         # If this is the meter installation table and the repeat nested key exists
