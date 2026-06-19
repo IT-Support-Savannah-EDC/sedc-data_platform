@@ -192,23 +192,43 @@ def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params
 def upsert_raw_data(df, table_name, conflict_key="__id"):
     if df.empty: return 0
     staging_table = f"temp_{table_name}_{int(time.time())}"
+    
+    # 1. Ensure target table exists
     df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
     sync_schema(df, table_name)
     
-    # FIX: Native rollback handling. Let the context manager handle the aborts cleanly.
+    # 2. DYNAMIC FIX: Guarantee that the permanent target table has a unique index on the conflict key
+    with engine.begin() as label_conn:
+        # Check if an index already handles this column to avoid duplicate index errors
+        index_check = text("""
+            SELECT 1 FROM pg_indexes 
+            WHERE schemaname = :schema 
+              AND tablename = :table 
+              AND indexdef LIKE :col_match;
+        """)
+        has_index = label_conn.execute(index_check, {
+            "schema": TARGET_SCHEMA,
+            "table": table_name,
+            "col_match": f'%("{conflict_key}")%'
+        }).scalar()
+        
+        if not has_index:
+            logger.info(f"🔑 Creating missing Unique Constraint on permanent table: {TARGET_SCHEMA}.{table_name} ({conflict_key})")
+            # Build a deterministic index name to avoid naming collisions
+            idx_name = f"idx_uq_{table_name}_{conflict_key.strip('_')}"
+            label_conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" ON "{TARGET_SCHEMA}"."{table_name}" ("{conflict_key}");'))
+
+    # 3. Proceed with the atomic staging upsert safely
     with engine.begin() as conn:
         conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
         df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
         
-        # This will now safely target the actual '_id'
         conn.execute(text(f'CREATE UNIQUE INDEX ON "{staging_table}" ("{conflict_key}");'))
         
         cols = [f'"{c}"' for c in df.columns]
         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
-        conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
         
-        # If the above commands succeed, cleanly drop the temp table at the end of the transaction.
-        # If they fail, the transaction rolls back and Postgres auto-destroys the temp table.
+        conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
         conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
             
     return len(df)
