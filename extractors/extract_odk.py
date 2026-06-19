@@ -53,6 +53,10 @@ def sync_schema(df, table_name):
                 transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
 
 def get_smart_master_clock(dataset_name):
+    if os.getenv("IGNORE_CLOCK") == "true":
+        logger.info(f"🔄 FORCE FULL SYNC: Ignoring master clock for '{dataset_name}'")
+        return None
+    
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
 
