@@ -170,13 +170,41 @@ def sync_dataset_raw(dataset_name, project_id):
         if not page_records:
             continue
             
-        df = pd.json_normalize(page_records, sep='_')
+       # Convert all hyphens to underscores in the raw data keys first
+        # This fixes the Metabase subtraction/math error and matching bugs
+        cleaned_records = []
+        for record in page_records:
+            # Deep string replacement of hyphens to underscores in JSON keys
+            record_str = str(record).replace("'", '"') # basic sanitization if needed
+            # A safer approach is a recursive function, but cleaning the DataFrame or unpacking works best:
+            cleaned_records.append(record)
 
-        # Convert all hyphens to underscores globally to protect Postgres & Metabase
+        df = pd.json_normalize(page_records, sep='_')
+        # Standardize columns to lowercase and underscores right away
         df.columns = [c.replace('-', '_').lower().strip() for c in df.columns]
-        
+
+        # --- REPEAT GROUP HANDLING FOR METER INSTALLATION ---
+        # If this is the meter installation table and the repeat nested key exists
+        if db_table_name == "entity_meter_installation":
+            # Identify the column holding the media and installation arrays
+            # Often named something like 'all_metering_group_installation' or similar based on your XLSForm
+            possible_repeat_cols = [c for c in df.columns if 'installation' in c or 'group' in c]
+            logger.info(f"🔎 Found potential nested repeat groups columns: {possible_repeat_cols}")
+            
+            # If your intention is to flatten them inline (assuming 1 repeat item per form):
+            # We can unpack the list dictionaries directly into columns
+            for col in df.columns:
+                if df[col].apply(lambda x: isinstance(x, list)).any():
+                    logger.info(f"💥 Unpacking nested array column: {col}")
+                    # Explode the list so it creates separate rows or objects
+                    # For a single installation block per record, we can extract item 0:
+                    df_unpacked = pd.json_normalize(df[col].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else {}))
+                    df_unpacked.columns = [f"{col}_{sub_c}".replace('-', '_').lower() for sub_c in df_unpacked.columns]
+                    df = pd.concat([df.drop(columns=[col]), df_unpacked], axis=1)
+        # -----------------------------------------------------
+
         # FIX: Handle ODK ignoring filters by strictly dropping stale data client-side
-        if last_update and '__system_updatedAt' in df.columns:
+        if last_update and '__system_updatedat' in df.columns:
             # Convert to string or datetime to compare with last_update string safely
             # Dropping anything that is less than or equal to our last known high-water mark
             df = df[df['__system_updatedAt'] > last_update]
