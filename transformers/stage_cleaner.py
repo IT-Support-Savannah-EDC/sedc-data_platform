@@ -78,7 +78,9 @@ def sync_staging_schema(engine, df, staging_table, conflict_key):
 def upsert_to_staging(df, table_name, chunk_idx):
     if df.empty:
         return
-        
+
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
+    
     engine = get_engine()
     staging_table = f"stage_{table_name.lower()}"
     conflict_key = next((c for c in ['__id', 'id'] if c in df.columns), None)
