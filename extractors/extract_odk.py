@@ -216,6 +216,27 @@ def sync_dataset_raw(dataset_name, project_id):
         for col in df.columns:
             if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
                 df[col] = df[col].astype(str)
+
+        # --- DIAGNOSTIC BLOCK: CHECKING FOR MEDIA DATA ---
+        media_cols = [c for c in df.columns if 'picture' in c or 'video' in c]
+        if media_cols:
+            logger.info(f"📸 Scanning {len(media_cols)} media columns in this chunk...")
+            found_any = False
+            for mc in media_cols:
+                # Filter out nulls, NaNs, and empty strings
+                valid_data = df[df[mc].notna() & (df[mc] != '') & (df[mc].astype(str).str.lower() != 'nan')][mc].tolist()
+                if valid_data:
+                    logger.info(f"✅ Data found in '{mc}': {valid_data[:3]}...")
+                    found_any = True
+            
+            if not found_any:
+                logger.warning("⚠️ All media columns in these recent delta records are completely empty/null.")
+        # -------------------------------------------------
+
+        # FIX: Stringify complex dictionaries/lists so psycopg2 doesn't crash or spike memory
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                df[col] = df[col].astype(str)
                 
         count = upsert_raw_data(df, db_table_name, conflict_key="__id")
         total_written += count
