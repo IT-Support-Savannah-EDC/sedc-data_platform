@@ -177,7 +177,7 @@ def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params
         current_params['$skip'] = skip
         
         logger.info(f"📡 Downloading Form ({form_id}) OData chunk for '{table_endpoint}': records {skip} to {skip+top}...")
-        response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=15, params=current_params)
+        response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=120, params=current_params)
         response.raise_for_status()
         
         data = response.json().get('value', [])
@@ -265,8 +265,16 @@ def sync_form_raw(form_id, project_id):
             clean_suffix = table_endpoint.replace("Submissions.", "").replace(".", "_").lower()
             db_table_name = f"form_{base_name}_{clean_suffix}"
 
-        # CRITICAL FIX: Isolate parameters for this endpoint loop and strip $filter for sub-tables.
-        # ODK Central does not support top-level __system/ metadata filters on relational repeat tables.
+            # CRITICAL SELF-HEALING FIX: Drop legacy parent '_id' constraints on sub-tables 
+            # to clear out old unique violation blocks left behind by older code versions.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{db_table_name}" DROP CONSTRAINT IF EXISTS "idx_uq_{db_table_name}_id";'))
+                    conn.execute(text(f'DROP INDEX IF EXISTS "{TARGET_SCHEMA}"."idx_uq_{db_table_name}_id";'))
+            except Exception:
+                pass # Table or constraint might not exist yet, safe to proceed
+
+        # Isolate parameters for this endpoint loop and strip $filter for sub-tables.
         current_params = base_params.copy()
         if table_endpoint != "Submissions" and "$filter" in current_params:
             logger.debug(f"🧹 Scrubbing system metadata $filter parameter from sub-table query: {table_endpoint}")
@@ -286,7 +294,6 @@ def sync_form_raw(form_id, project_id):
 
             # Determine the primary conflict key based on table depth
             if table_endpoint == "Submissions":
-                # Top level unique keys mapping
                 if "_id" in df.columns:
                     conflict_key = "_id"
                 elif "__id" in df.columns:
@@ -297,15 +304,14 @@ def sync_form_raw(form_id, project_id):
                     id_cols = [c for c in df.columns if c.endswith('_id')]
                     conflict_key = id_cols[0] if id_cols else df.columns[0]
             else:
-                # CRITICAL FIX: Relational sub-tables (repeat groups) use a different primary key strategy.
-                # In nested structures, '_id' belongs to the parent row. The child rows have an internal row id or sequential ID.
-                # If an internal sub-table id column is missing, fall back safely to avoid creating constraints on parent key.
-                if "id" in df.columns:
+                # Relational sub-tables primary key strategy
+                if "customer_class_update_id" in df.columns:
+                    conflict_key = "customer_class_update_id"
+                elif "id" in df.columns:
                     conflict_key = "id"
                 elif "subid" in df.columns:
                     conflict_key = "subid"
                 else:
-                    # Look for columns matching sub-table keys instead of structural metadata
                     non_meta_id_cols = [c for c in df.columns if c.endswith('id') and c != '_id']
                     conflict_key = non_meta_id_cols[0] if non_meta_id_cols else df.columns[0]
 
