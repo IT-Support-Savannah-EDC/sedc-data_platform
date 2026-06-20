@@ -42,39 +42,30 @@ def discover_conflict_key(inspector, table_name, schema="data_raw"):
         if constraint.get("column_names"):
             return constraint["column_names"][0]
             
-    # 3. CRITICAL FIX: Check for Unique Indexes (which extract_odk.py generates)
+    # 3. Check for Unique Indexes (which extract_odk.py generates)
     indexes = inspector.get_indexes(table_name, schema=schema)
     for idx in indexes:
         if idx.get("unique") and idx.get("column_names"):
-            # Ensure we only grab single-column unique indexes
             if len(idx["column_names"]) == 1:
                 return idx["column_names"][0]
 
     # 4. Structural inspection fallbacks for ODK/Entity naming schemas
     columns = [c["name"] for c in inspector.get_columns(table_name, schema=schema)]
-    
-    # Isolate child sub-tables from main tables and entities
     is_sub_table = table_name.startswith("form_") and not table_name.endswith("_main")
     
     if is_sub_table:
-        # CRITICAL FIX: Sub-tables must NOT use the parent's '_id' or '__id'
         if "id" in columns: return "id"
         if "subid" in columns: return "subid"
-        
-        # Find any ID column that isn't a known parent/system identifier
         valid_ids = [c for c in columns if c.endswith('id') and c not in ['_id', '__id', '_submissions_id']]
-        if valid_ids:
-            return valid_ids[0]
+        if valid_ids: return valid_ids[0]
     else:
-        # Main forms and Entities safely use top-level IDs
         if "__id" in columns: return "__id"
         if "_id" in columns: return "_id"
         if "meta_instanceid" in columns: return "meta_instanceid"
         
-    # Absolute generic fallback matching generic identifier patterns
     generic_ids = [c for c in columns if 'id' in c.lower() and c not in ['_id', '__id']]
     return generic_ids[0] if generic_ids else columns[0]
-    
+
 def sync_refined_schema(conn, raw_table, refined_table, conflict_key):
     """Ensures target table exists, evolves with new raw columns, and preserves audit watermarks."""
     # 1. Handle base table missing (Clones structure from data_raw)
@@ -83,11 +74,9 @@ def sync_refined_schema(conn, raw_table, refined_table, conflict_key):
         logger.info(f"✨ Target table data_refined.{refined_table} missing. Building structure...")
         conn.execute(text(f'CREATE TABLE "data_refined"."{refined_table}" (LIKE "data_raw"."{raw_table}" INCLUDING ALL);'))
         
-        # Enforce target indexing matching the source conflict key to support ON CONFLICT handling
-        try:
-            conn.execute(text(f'ALTER TABLE "data_refined"."{refined_table}" ADD CONSTRAINT "{refined_table}_pk" PRIMARY KEY ("{conflict_key}");'))
-        except Exception:
-            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{refined_table}_{conflict_key}_idx" ON "data_refined"."{refined_table}" ("{conflict_key}");'))
+        # CRITICAL FIX: Use UNIQUE INDEX instead of PRIMARY KEY to prevent NotNullViolations from Ghost Rows
+        idx_name = f"idx_uq_{refined_table}_{conflict_key.strip('_')}"
+        conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" ON "data_refined"."{refined_table}" ("{conflict_key}");'))
 
     # 2. Schema Evolution (Compares data_refined against data_raw)
     raw_col_query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = 'data_raw' AND table_name = :t")
@@ -110,9 +99,7 @@ def sync_refined_schema(conn, raw_table, refined_table, conflict_key):
 
 def upsert_raw_to_refined(inspector, raw_table):
     """Upserts cleaned data from raw to refined schema dynamically without modifying the immutable raw history."""
-    refined_table = raw_table  # Direct 1:1 mapping mapping for seamless traceability
-    
-    # Resolve conflict key dynamically for this specific table structure
+    refined_table = raw_table  
     conflict_key = discover_conflict_key(inspector, raw_table, schema="data_raw")
     logger.info(f"🔍 Table tracking: data_raw.{raw_table} uses conflict key: '{conflict_key}'")
 
@@ -122,13 +109,8 @@ def upsert_raw_to_refined(inspector, raw_table):
             logger.info(f"ℹ️ Table data_raw.{raw_table} is empty. Skipping refinement process.")
             return
 
-        # Pass raw_table as structural architecture reference
         sync_refined_schema(conn, raw_table, refined_table, conflict_key)
-        
-        # Read mutual schema alignment between data_raw and data_refined
         shared_cols = get_shared_columns(conn, "data_raw", raw_table, "data_refined", refined_table)
-        
-        # Filter out audit timestamps from shared matching list to manually handle them cleanly
         shared_cols = [c for c in shared_cols if c not in ["__createdat", "__updatedat"]]
         
         col_str = ", ".join([f'"{c}"' for c in shared_cols])
@@ -138,14 +120,16 @@ def upsert_raw_to_refined(inspector, raw_table):
         update_cols = [c for c in shared_cols if c != conflict_key]
         if update_cols:
             update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
-            update_str += ', "__updatedat" = NOW()'  # Explicitly advance clock on overwrite
+            update_str += ', "__updatedat" = NOW()'
             do_clause = f"DO UPDATE SET {update_str}"
         else:
             do_clause = "DO NOTHING"
 
+        # CRITICAL FIX: Added `WHERE IS NOT NULL` to safely bypass untrackable ghost rows
         upsert_query = text(f"""
             INSERT INTO "data_refined"."{refined_table}" ({insert_cols})
             SELECT {select_cols} FROM "data_raw"."{raw_table}"
+            WHERE "{conflict_key}" IS NOT NULL
             ON CONFLICT ("{conflict_key}") {do_clause};
         """)
         
@@ -157,8 +141,6 @@ if __name__ == "__main__":
     logger.info("🎬 Initializing Dynamic Raw-to-Refined Production Pipeline...")
     try:
         inspector = inspect(engine)
-        
-        # Scan complete data_raw schema comprehensively
         raw_tables = inspector.get_table_names(schema="data_raw")
         
         if not raw_tables:
