@@ -35,7 +35,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
 
 retry_db = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=50),
-                 retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
+                retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
 
 def get_smart_master_clock(table_name):
     """
