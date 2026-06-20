@@ -3,8 +3,8 @@ import subprocess
 import logging
 import sys
 import requests
+import time
 from dotenv import load_dotenv
-from transformers.stage_cleaner import run_cleaning_pipeline
 
 load_dotenv("/opt/data_platform/config/.env")
 
@@ -82,24 +82,20 @@ if __name__ == "__main__":
         extractor_logs = run_script("/opt/data_platform/extractors/extract_odk.py")
         pipeline_summary += f"=== Extractor Phase ===\n{extractor_logs}\n\n"
         
+        # 30-Second Isolation Delay
+        logger.info("⏳ Cooling down. Pausing for 30 seconds before launching next stage...")
+        time.sleep(30)
+        
         # Node 2: Main Transform / Load Phase
         loader_logs = run_script("/opt/data_platform/loaders/load_refined.py")
         pipeline_summary += f"=== Main Loader Phase ===\n{loader_logs}\n\n"
         
-        # Node 3: Media Link Phase (Legacy/Specific Media Handling)
-        pipeline_summary += f"=== Media Link Loader Phase ===\n{media_logs}\n\n"
-        
-        # Node 4: Native Stage Cleaner Phase (Vectorized Transformation)
-        logger.info("🧹 Launching Native Pipeline Node: Stage Cleaner")
-        run_cleaning_pipeline()
-        pipeline_summary += "=== Native Stage Cleaner Phase ===\nSuccessfully executed vectorized transformations.\n\n"
-        
-        # If we reach here, everything succeeded perfectly
+        # Success Telemetry Target
         logger.info("🏁 Pipeline Execution Flawless! Notifying AI Assistant...")
         send_to_ai_assistant(
             status="SUCCESS",
             title="Pipeline Runs Green",
-            message="All scheduled sync configurations successfully converged without errors.",
+            message="ODK Extraction and Refined Loading sync loops successfully completed without errors.",
             raw_logs=pipeline_summary
         )
         
