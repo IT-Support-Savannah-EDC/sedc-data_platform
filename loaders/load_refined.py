@@ -26,26 +26,60 @@ def get_shared_columns(conn, source_schema, source_table, target_schema, target_
     refined_cols = {row[0] for row in conn.execute(query, {"s": target_schema, "t": target_table}).fetchall()}
     return list(source_cols.intersection(refined_cols))
 
-def sync_refined_schema(conn, staging_table, refined_table):
-    """Ensures target table exists, evolves with new staging columns, and preserves audit watermarks."""
-    # 1. Handle base table missing (Clones structure from data_staging to preserve proxy columns)
+def discover_conflict_key(inspector, table_name, schema="data_raw"):
+    """
+    Dynamically resolves the optimal conflict/primary key for a table.
+    Checks DB primary keys, unique constraints, and falls back to structured naming conventions.
+    """
+    # 1. Check for physical primary keys assigned in database
+    pk_info = inspector.get_pk_constraint(table_name, schema=schema)
+    if pk_info and pk_info.get("constrained_columns"):
+        return pk_info["constrained_columns"][0]
+    
+    # 2. Check for explicit unique constraints 
+    unique_constraints = inspector.get_unique_constraints(table_name, schema=schema)
+    for constraint in unique_constraints:
+        if constraint.get("column_names"):
+            return constraint["column_names"][0]
+            
+    # 3. Structural inspection fallbacks for ODK/Entity naming schemas
+    columns = [c["name"] for c in inspector.get_columns(table_name, schema=schema)]
+    if "__id" in columns:
+        return "__id"
+    if "_id" in columns:
+        return "_id"
+        
+    # Look for sub-table relational primary IDs (e.g., customer_class_update_id)
+    id_cols = [c for c in columns if c.endswith('_id') and c != '_id']
+    if id_cols:
+        return id_cols[0]
+        
+    # Absolute generic fallback matching generic identifier patterns
+    generic_ids = [c for c in columns if 'id' in c.lower()]
+    return generic_ids[0] if generic_ids else columns[0]
+
+def sync_refined_schema(conn, raw_table, refined_table, conflict_key):
+    """Ensures target table exists, evolves with new raw columns, and preserves audit watermarks."""
+    # 1. Handle base table missing (Clones structure from data_raw)
     exists_query = text("SELECT exists (SELECT FROM pg_tables WHERE schemaname = 'data_refined' AND tablename = :t)")
     if not conn.execute(exists_query, {"t": refined_table}).scalar():
         logger.info(f"✨ Target table data_refined.{refined_table} missing. Building structure...")
-        conn.execute(text(f'CREATE TABLE "data_refined"."{refined_table}" (LIKE "data_staging"."{staging_table}" INCLUDING ALL);'))
+        conn.execute(text(f'CREATE TABLE "data_refined"."{refined_table}" (LIKE "data_raw"."{raw_table}" INCLUDING ALL);'))
+        
+        # Enforce target indexing matching the source conflict key to support ON CONFLICT handling
         try:
-            conn.execute(text(f'ALTER TABLE "data_refined"."{refined_table}" ADD CONSTRAINT "{refined_table}_pk" PRIMARY KEY ("__id");'))
+            conn.execute(text(f'ALTER TABLE "data_refined"."{refined_table}" ADD CONSTRAINT "{refined_table}_pk" PRIMARY KEY ("{conflict_key}");'))
         except Exception:
-            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{refined_table}__id_idx" ON "data_refined"."{refined_table}" ("__id");'))
+            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{refined_table}_{conflict_key}_idx" ON "data_refined"."{refined_table}" ("{conflict_key}");'))
 
-    # 2. Schema Evolution (Compares data_refined against data_staging)
-    staging_col_query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = 'data_staging' AND table_name = :t")
+    # 2. Schema Evolution (Compares data_refined against data_raw)
+    raw_col_query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = 'data_raw' AND table_name = :t")
     refined_col_query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = 'data_refined' AND table_name = :t")
     
-    staging_cols = {row[0] for row in conn.execute(staging_col_query, {"t": staging_table}).fetchall()}
+    raw_cols = {row[0] for row in conn.execute(raw_col_query, {"t": raw_table}).fetchall()}
     refined_cols = {row[0] for row in conn.execute(refined_col_query, {"t": refined_table}).fetchall()}
     
-    missing_cols = [col for col in staging_cols if col not in refined_cols]
+    missing_cols = [col for col in raw_cols if col not in refined_cols]
     if missing_cols:
         logger.info(f"🧬 Schema Evolution: Adding {len(missing_cols)} columns to data_refined.{refined_table}")
         for col in missing_cols:
@@ -57,22 +91,25 @@ def sync_refined_schema(conn, staging_table, refined_table):
             logger.info(f"➕ Injecting mandatory watermark tracking column '{col}' into data_refined.{refined_table}")
             conn.execute(text(f'ALTER TABLE "data_refined"."{refined_table}" ADD COLUMN "{col}" TIMESTAMP WITH TIME ZONE DEFAULT NOW();'))
 
-def move_and_clear_table(staging_table, pk_column="__id"):
-    """Upserts cleaned data from staging to refined schema, then flushes the staging table."""
-    # Convert 'stage_staff_register' -> 'staff_register'
-    refined_table = staging_table.replace("stage_", "")
+def upsert_raw_to_refined(inspector, raw_table):
+    """Upserts cleaned data from raw to refined schema dynamically without modifying the immutable raw history."""
+    refined_table = raw_table  # Direct 1:1 mapping mapping for seamless traceability
     
+    # Resolve conflict key dynamically for this specific table structure
+    conflict_key = discover_conflict_key(inspector, raw_table, schema="data_raw")
+    logger.info(f"🔍 Table tracking: data_raw.{raw_table} uses conflict key: '{conflict_key}'")
+
     with engine.begin() as conn:
-        row_check = conn.execute(text(f'SELECT COUNT(1) FROM "data_staging"."{staging_table}";')).scalar()
+        row_check = conn.execute(text(f'SELECT COUNT(1) FROM "data_raw"."{raw_table}";')).scalar()
         if row_check == 0:
-            logger.info(f"ℹ️ Table data_staging.{staging_table} is empty. Skipping refinement process.")
+            logger.info(f"ℹ️ Table data_raw.{raw_table} is empty. Skipping refinement process.")
             return
 
-        # Pass staging_table as the structure source
-        sync_refined_schema(conn, staging_table, refined_table)
+        # Pass raw_table as structural architecture reference
+        sync_refined_schema(conn, raw_table, refined_table, conflict_key)
         
-        # Read mutual schema alignment between data_staging and data_refined
-        shared_cols = get_shared_columns(conn, "data_staging", staging_table, "data_refined", refined_table)
+        # Read mutual schema alignment between data_raw and data_refined
+        shared_cols = get_shared_columns(conn, "data_raw", raw_table, "data_refined", refined_table)
         
         # Filter out audit timestamps from shared matching list to manually handle them cleanly
         shared_cols = [c for c in shared_cols if c not in ["__createdat", "__updatedat"]]
@@ -81,7 +118,7 @@ def move_and_clear_table(staging_table, pk_column="__id"):
         insert_cols = col_str + ', "__createdat", "__updatedat"'
         select_cols = col_str + ', NOW(), NOW()'
         
-        update_cols = [c for c in shared_cols if c != pk_column]
+        update_cols = [c for c in shared_cols if c != conflict_key]
         if update_cols:
             update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
             update_str += ', "__updatedat" = NOW()'  # Explicitly advance clock on overwrite
@@ -91,33 +128,31 @@ def move_and_clear_table(staging_table, pk_column="__id"):
 
         upsert_query = text(f"""
             INSERT INTO "data_refined"."{refined_table}" ({insert_cols})
-            SELECT {select_cols} FROM "data_staging"."{staging_table}"
-            ON CONFLICT ("{pk_column}") {do_clause};
+            SELECT {select_cols} FROM "data_raw"."{raw_table}"
+            ON CONFLICT ("{conflict_key}") {do_clause};
         """)
         
         result = conn.execute(upsert_query)
         logger.info(f"📥 Upsert complete for data_refined.{refined_table}. Rows affected: {result.rowcount}")
-
-        # Safe purge step: Only clear data_staging after the upsert succeeds
-        conn.execute(text(f'TRUNCATE TABLE "data_staging"."{staging_table}" RESTART IDENTITY;'))
-        logger.info(f"🧹 Staging Zone Cleared: data_staging.{staging_table} has been emptied.")
+        logger.info(f"🛡️ Raw ledger preserved: data_raw.{raw_table} data retained intact.")
 
 if __name__ == "__main__":
-    logger.info("🎬 Initializing Dynamic Staging-to-Refined Pipeline...")
+    logger.info("🎬 Initializing Dynamic Raw-to-Refined Production Pipeline...")
     try:
         inspector = inspect(engine)
-        # Scan data_staging schema instead of data_raw
-        staging_tables = inspector.get_table_names(schema="data_staging")
-        target_tables = [t for t in staging_tables if t.startswith("stage_")]
         
-        if not target_tables:
-            logger.info("⏸️ Staging layer empty. No data to load. Exiting.")
+        # Scan complete data_raw schema comprehensively
+        raw_tables = inspector.get_table_names(schema="data_raw")
+        
+        if not raw_tables:
+            logger.info("⏸️ Raw data layer empty. No data to process. Exiting.")
             sys.exit(0)
             
-        for table in target_tables:
-            move_and_clear_table(table, pk_column="__id")
+        logger.info(f"Total discovered tables for processing: {len(raw_tables)}")
+        for table in raw_tables:
+            upsert_raw_to_refined(inspector, table)
             
-        logger.info("✅ Core dynamic refinement loading sequence complete.")
+        logger.info("✅ Production dynamic refinement loading sequence complete.")
             
     except Exception as e:
         logger.critical(f"💥 Load engine halted: {e}", exc_info=True)
