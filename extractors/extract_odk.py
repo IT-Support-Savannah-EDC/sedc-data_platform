@@ -169,7 +169,7 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
 def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=None):
     if params is None: params = {}
     skip = 0
-    top = 2000
+    top = 1500
     
     while True:
         current_params = params.copy()
@@ -305,14 +305,17 @@ def sync_form_raw(form_id, project_id):
                     conflict_key = id_cols[0] if id_cols else df.columns[0]
             else:
                 # Relational sub-tables primary key strategy
-                if "customer_class_update_id" in df.columns:
-                    conflict_key = "customer_class_update_id"
-                elif "id" in df.columns:
-                    conflict_key = "id"
+                if "_id" in df.columns:
+                    conflict_key = "_id"
+                elif "__id" in df.columns:
+                    conflict_key = "__id"
+                elif "customer_class_update_id" in df.columns:
+                    conflict_key = "customer_key"
                 elif "subid" in df.columns:
                     conflict_key = "subid"
                 else:
-                    non_meta_id_cols = [c for c in df.columns if c.endswith('id') and c != '_id']
+                    # Fallback to any ending with id that isn't the raw sequential 'id'
+                    non_meta_id_cols = [c for c in df.columns if c.endswith('id') and c != 'id']
                     conflict_key = non_meta_id_cols[0] if non_meta_id_cols else df.columns[0]
 
             # Safely deduplicate the DataFrame *before* SQL insertion to prevent transient duplicates
