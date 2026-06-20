@@ -29,7 +29,7 @@ def get_shared_columns(conn, source_schema, source_table, target_schema, target_
 def discover_conflict_key(inspector, table_name, schema="data_raw"):
     """
     Dynamically resolves the optimal conflict/primary key for a table.
-    Checks DB primary keys, unique constraints, and falls back to structured naming conventions.
+    Checks DB primary keys, unique constraints, unique indexes, and falls back to structured naming conventions.
     """
     # 1. Check for physical primary keys assigned in database
     pk_info = inspector.get_pk_constraint(table_name, schema=schema)
@@ -42,22 +42,39 @@ def discover_conflict_key(inspector, table_name, schema="data_raw"):
         if constraint.get("column_names"):
             return constraint["column_names"][0]
             
-    # 3. Structural inspection fallbacks for ODK/Entity naming schemas
+    # 3. CRITICAL FIX: Check for Unique Indexes (which extract_odk.py generates)
+    indexes = inspector.get_indexes(table_name, schema=schema)
+    for idx in indexes:
+        if idx.get("unique") and idx.get("column_names"):
+            # Ensure we only grab single-column unique indexes
+            if len(idx["column_names"]) == 1:
+                return idx["column_names"][0]
+
+    # 4. Structural inspection fallbacks for ODK/Entity naming schemas
     columns = [c["name"] for c in inspector.get_columns(table_name, schema=schema)]
-    if "__id" in columns:
-        return "__id"
-    if "_id" in columns:
-        return "_id"
+    
+    # Isolate child sub-tables from main tables and entities
+    is_sub_table = table_name.startswith("form_") and not table_name.endswith("_main")
+    
+    if is_sub_table:
+        # CRITICAL FIX: Sub-tables must NOT use the parent's '_id' or '__id'
+        if "id" in columns: return "id"
+        if "subid" in columns: return "subid"
         
-    # Look for sub-table relational primary IDs (e.g., customer_class_update_id)
-    id_cols = [c for c in columns if c.endswith('_id') and c != '_id']
-    if id_cols:
-        return id_cols[0]
+        # Find any ID column that isn't a known parent/system identifier
+        valid_ids = [c for c in columns if c.endswith('id') and c not in ['_id', '__id', '_submissions_id']]
+        if valid_ids:
+            return valid_ids[0]
+    else:
+        # Main forms and Entities safely use top-level IDs
+        if "__id" in columns: return "__id"
+        if "_id" in columns: return "_id"
+        if "meta_instanceid" in columns: return "meta_instanceid"
         
     # Absolute generic fallback matching generic identifier patterns
-    generic_ids = [c for c in columns if 'id' in c.lower()]
+    generic_ids = [c for c in columns if 'id' in c.lower() and c not in ['_id', '__id']]
     return generic_ids[0] if generic_ids else columns[0]
-
+    
 def sync_refined_schema(conn, raw_table, refined_table, conflict_key):
     """Ensures target table exists, evolves with new raw columns, and preserves audit watermarks."""
     # 1. Handle base table missing (Clones structure from data_raw)
