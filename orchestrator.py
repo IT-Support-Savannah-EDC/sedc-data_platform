@@ -41,37 +41,48 @@ def send_to_ai_assistant(status, title, message, raw_logs=""):
         logger.error(f"⚠️ Telemetry transport layer breakdown: {e}")
 
 def run_script(script_path):
-    """Executes a standalone script via subprocess."""
+    """
+    Executes a standalone script via subprocess and streams its stdout/stderr 
+    directly to the terminal in real-time line-by-line.
+    """
     script_name = os.path.basename(script_path)
     logger.info(f"🚀 Launching pipeline node: {script_name}")
     
     python_bin = "/opt/data_platform/venv/bin/python"
     
-    result = subprocess.run(
+    # Redirect stderr to stdout to preserve chronologically ordered logging output
+    process = subprocess.Popen(
         [python_bin, script_path], 
-        capture_output=True, 
-        text=True
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, 
+        text=True,
+        bufsize=1
     )
     
-    if result.stdout:
-        print(result.stdout.strip())
-    if result.stderr:
-        print(result.stderr.strip(), file=sys.stderr)
-        
-    combined_logs = f"--- STDOUT ---\n{result.stdout}\n--- STDERR ---\n{result.stderr}"
+    combined_logs = []
     
-    if result.returncode != 0:
+    # Stream logs line-by-line to the console immediately as they generate
+    for line in iter(process.stdout.readline, ''):
+        print(line, end='', flush=True)
+        combined_logs.append(line)
+        
+    process.stdout.close()
+    return_code = process.wait()
+    
+    full_logs_str = "".join(combined_logs)
+    
+    if return_code != 0:
         logger.critical(f"❌ Component Collapse: {script_name}")
         send_to_ai_assistant(
             status="CRITICAL",
             title=f"Pipeline Failure: {script_name}",
-            message=f"The node '{script_name}' crashed with exit code {result.returncode}.",
-            raw_logs=combined_logs
+            message=f"The node '{script_name}' crashed with exit code {return_code}.",
+            raw_logs=full_logs_str
         )
         sys.exit(1)
         
     logger.info(f"✅ Node Execution Verified: {script_name}")
-    return combined_logs
+    return full_logs_str
 
 if __name__ == "__main__":
     logger.info("🟢 Starting Operational Data Pipeline Sequence...")
