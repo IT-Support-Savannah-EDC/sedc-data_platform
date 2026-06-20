@@ -1,9 +1,11 @@
 import os
 import sys
-import time
+import uuid
+import json
 import logging
 import pandas as pd
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import DBAPIError, OperationalError
 from pyodk.client import Client
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def validate_config():
-    required_vars = {"EPU_ASSISTANT_URL": "Webhook URL", "PROJECT_ID": "Project ID", "DATABASE_URL": "DB URL"}
+    required_vars = {"PROJECT_ID", "DATABASE_URL"}
     missing = [var for var in required_vars if not os.getenv(var)]
     if missing:
         logger.critical(f"❌ MISSING CONFIGURATION: {', '.join(missing)}")
@@ -35,94 +37,24 @@ client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
 retry_db = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=50),
                  retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
 
-@retry_db
-def sync_schema(df, table_name):
-    if df.empty: return
-    with engine.connect() as conn:
-        exists_query = text("SELECT exists (SELECT FROM pg_tables WHERE schemaname = :s AND tablename = :t)")
-        if not conn.execute(exists_query, {"s": TARGET_SCHEMA, "t": table_name}).scalar(): return
-        
-        query = text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = :t")
-        existing_cols = {row[0] for row in conn.execute(query, {"s": TARGET_SCHEMA, "t": table_name}).fetchall()}
-    
-    new_cols = [col for col in df.columns if col not in existing_cols]
-    if new_cols:
-        logger.info(f"🧬 Schema Evolution: Adding {len(new_cols)} columns to {TARGET_SCHEMA}.{table_name}")
-        with engine.begin() as transaction_conn:
-            for col in new_cols:
-                transaction_conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{table_name}" ADD COLUMN "{col}" TEXT'))
-
-def get_smart_master_clock(object_name, is_form=False):
+def get_smart_master_clock(table_name):
     """
-    Dynamically resolves high-water mark timestamps across forms and datasets.
-    Checks data_refined first (for down-stream logic), falling back to data_raw.
+    Simplified Clock: Queries the standardized 'odk_timestamp' column directly.
     """
-    # 1. Standardize base string formatting
-    if is_form:
-        base_name = object_name.replace('-', '_').replace(' ', '_').lower()
-        refined_table = f"form_{base_name}"
-        raw_table = f"form_{base_name}_main"
-    else:
-        base_name = object_name.replace(' ', '_').lower()
-        if base_name == "customers_db": 
-            base_name = "customer_db"
-        refined_table = base_name
-        raw_table = f"entity_{base_name}"
-    
-    inspector = inspect(engine)
-    target_schema = None
-    target_table = None
-
-    # 2. Determine highest priority target table available
-    if inspector.has_table(refined_table, schema="data_refined"):
-        target_schema = "data_refined"
-        target_table = refined_table
-    elif inspector.has_table(raw_table, schema="data_raw"):
-        target_schema = "data_raw"
-        target_table = raw_table
-    else:
-        return None
-        
-    try: 
-        # 3. Dynamic Column Discovery to handle case variants & single vs double underscore formatting
-        existing_columns = [c['name'].lower() for c in inspector.get_columns(target_table, schema=target_schema)]
-        
-        target_col = None
-        if is_form:
-            # Form timelines prioritize submission or update tracking fields
-            priority_cols = ['_system_submissiondate', '__system_submissiondate', '_system_updatedat', '__system_updatedat']
-        else:
-            # Dataset timelines prioritize system update tracking fields
-            priority_cols = ['__system_updatedat', '_system_updatedat', '__system_createdat', '_system_createdat']
-            
-        for col in priority_cols:
-            if col in existing_columns:
-                target_col = col
-                break
-                
-        # Safe structural fallback if no priority meta field matches perfectly
-        if not target_col:
-            fallback_match = [c for c in existing_columns if 'system' in c and ('date' in c or 'at' in c)]
-            if fallback_match:
-                target_col = fallback_match[0]
-                
-        if not target_col:
-            logger.warning(f"⚠️ No master clock column found in table {target_schema}.{target_table}")
-            return None
-
-        # 4. Fetch the absolute maximal timestamp value
-        query = text(f'SELECT MAX("{target_col}") FROM "{target_schema}"."{target_table}";')
+    query = text(f'SELECT MAX(odk_timestamp) FROM "{TARGET_SCHEMA}"."{table_name}";')
+    try:
         with engine.connect() as conn:
             max_val = conn.execute(query).scalar()
-            
             if max_val:
                 if isinstance(max_val, pd.Timestamp) or hasattr(max_val, 'strftime'):
                     return max_val.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 return str(max_val)
-    except Exception as e:
-        logger.warning(f"⚠️ Could not read clock from {target_schema}.{target_table}: {e}")
+    except Exception:
+        # Table likely doesn't exist yet, which is normal for a fresh run
+        pass
     return None
 
+# --- [ KEEP DISCOVERY & PAGINATION EXACTLY AS THEY WERE ] ---
 def discover_forms(project_id):
     logger.info("🔒 Fetching all active Forms from ODK Central...")
     try:
@@ -153,17 +85,15 @@ def fetch_entities_paginated(project_id, dataset_name, params=None):
         current_params['$top'] = top
         current_params['$skip'] = skip
         
-        logger.info(f"📡 Downloading Dataset API chunk: records {skip} to {skip+top}...")
-        response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", timeout=10, params=current_params)
+        logger.info(f"📡 Downloading Dataset chunk: records {skip} to {skip+top}...")
+        response = client.get(f"projects/{project_id}/datasets/{dataset_name}.svc/Entities", timeout=30, params=current_params)
         response.raise_for_status()
         
         data = response.json().get('value', [])
-        if not data:
-            break
+        if not data: break
             
         yield data
-        if len(data) < top:
-            break 
+        if len(data) < top: break 
         skip += top
 
 def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=None):
@@ -176,69 +106,84 @@ def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params
         current_params['$top'] = top
         current_params['$skip'] = skip
         
-        logger.info(f"📡 Downloading Form ({form_id}) OData chunk for '{table_endpoint}': records {skip} to {skip+top}...")
+        logger.info(f"📡 Downloading Form ({form_id}) chunk for '{table_endpoint}': records {skip} to {skip+top}...")
         response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=120, params=current_params)
         response.raise_for_status()
         
         data = response.json().get('value', [])
-        if not data:
-            break
+        if not data: break
             
         yield data
-        if len(data) < top:
-            break
+        if len(data) < top: break
         skip += top
+# ------------------------------------------------------------
 
-def upsert_raw_data(df, table_name, conflict_key="__id"):
+@retry_db
+def upsert_raw_data(df, table_name):
     if df.empty: return 0
-    staging_table = f"temp_{table_name}_{int(time.time())}"
+    staging_table = f"temp_{table_name}_{uuid.uuid4().hex[:8]}"
+    conflict_key = "_id"
     
-    # 1. Ensure target table exists
-    df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False)
-    sync_schema(df, table_name)
+    # 1. Ensure target table exists with the JSONB dtype mapping
+    df.head(0).to_sql(table_name, engine, schema=TARGET_SCHEMA, if_exists='append', index=False, dtype={'raw_record': JSONB})
     
-    # 2. DYNAMIC FIX: Guarantee that the permanent target table has a unique index on the conflict key
-    with engine.begin() as label_conn:
-        # Check if an index already handles this column to avoid duplicate index errors
-        index_check = text("""
-            SELECT 1 FROM pg_indexes 
-            WHERE schemaname = :schema 
-              AND tablename = :table 
-              AND indexdef LIKE :col_match;
-        """)
-        has_index = label_conn.execute(index_check, {
-            "schema": TARGET_SCHEMA,
-            "table": table_name,
-            "col_match": f'%("{conflict_key}")%'
-        }).scalar()
-        
-        if not has_index:
-            logger.info(f"🔑 Creating missing Unique Constraint on permanent table: {TARGET_SCHEMA}.{table_name} ({conflict_key})")
-            # Build a deterministic index name to avoid naming collisions
-            idx_name = f"idx_uq_{table_name}_{conflict_key.strip('_')}"
-            label_conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" ON "{TARGET_SCHEMA}"."{table_name}" ("{conflict_key}");'))
-
-    # 3. Proceed with the atomic staging upsert safely
+    # 2. Guarantee unique index on the standard '_id' column
     with engine.begin() as conn:
-        conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL)'))
-        df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000)
-        
-        conn.execute(text(f'CREATE UNIQUE INDEX ON "{staging_table}" ("{conflict_key}");'))
+        conn.execute(text(f'''
+            CREATE UNIQUE INDEX IF NOT EXISTS "idx_uq_{table_name}_id" 
+            ON "{TARGET_SCHEMA}"."{table_name}" ("{conflict_key}");
+        '''))
+
+    # 3. Atomic staging upsert using ON COMMIT DROP
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE TEMP TABLE "{staging_table}" (LIKE "{TARGET_SCHEMA}"."{table_name}" INCLUDING ALL) ON COMMIT DROP'))
+        df.to_sql(staging_table, conn, if_exists='append', index=False, chunksize=1000, dtype={'raw_record': JSONB})
         
         cols = [f'"{c}"' for c in df.columns]
         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c != conflict_key])
         
-        conn.execute(text(f'INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) SELECT {", ".join(cols)} FROM "{staging_table}" ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}'))
-        conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
+        upsert_query = f'''
+            INSERT INTO "{TARGET_SCHEMA}"."{table_name}" ({", ".join(cols)}) 
+            SELECT {", ".join(cols)} FROM "{staging_table}" 
+            ON CONFLICT ("{conflict_key}") DO UPDATE SET {update_str}
+        '''
+        conn.execute(text(upsert_query))
             
     return len(df)
+
+def parse_pure_raw(page_records):
+    """
+    Transforms ODK JSON arrays into a strict 4-column structural DataFrame:
+    _id, odk_timestamp, raw_record (JSON), and extracted_at.
+    """
+    parsed = []
+    extract_time = pd.Timestamp.utcnow()
+    
+    for row in page_records:
+        # 1. Resolve Unique ID safely
+        record_id = row.get('__id') or row.get('_id') or row.get('meta', {}).get('instanceID') or row.get('id')
+        if not record_id:
+            # Fallback for orphaned repeat groups: Hash the JSON to ensure it gets saved
+            record_id = uuid.uuid5(uuid.NAMESPACE_OID, json.dumps(row)).hex
+            
+        # 2. Resolve Master Timestamp safely (if it exists)
+        sys_block = row.get('__system', {})
+        record_ts = sys_block.get('updatedAt') or sys_block.get('submissionDate') or sys_block.get('createdAt')
+        
+        parsed.append({
+            '_id': str(record_id),
+            'odk_timestamp': pd.to_datetime(record_ts) if record_ts else None,
+            'raw_record': row, # Will be mapped to JSONB via SQLAlchemy
+            'extracted_at': extract_time
+        })
+        
+    return pd.DataFrame(parsed)
 
 def sync_form_raw(form_id, project_id):
     base_name = form_id.replace('-', '_').replace(' ', '_').lower()
     main_table_name = f"form_{base_name}_main"
     
-    # Unified incremental tracking protocol using smart clock 
-    last_update_str = get_smart_master_clock(form_id, is_form=True)
+    last_update_str = get_smart_master_clock(main_table_name)
     last_update = pd.to_datetime(last_update_str) if last_update_str else None
 
     base_params = {}
@@ -246,9 +191,9 @@ def sync_form_raw(form_id, project_id):
         buffered_time = last_update - pd.Timedelta(minutes=5)
         iso_timestamp = buffered_time.strftime('%Y-%m-%dT%H:%M:%SZ')
         base_params["$filter"] = f"(__system/submissionDate gt {iso_timestamp}) or (__system/updatedAt gt {iso_timestamp})"
-        logger.info(f"📡 Applying Form OData filter with 5-minute rolling safety buffer: {base_params['$filter']}")
+        logger.info(f"📡 Filter applied with 5-minute buffer: {base_params['$filter']}")
     else:
-        logger.info(f"📡 Initiating full baseline synchronization for Form '{form_id}'.")
+        logger.info(f"📡 Full baseline sync for Form '{form_id}'.")
 
     try:
         svc_response = client.get(f"projects/{project_id}/forms/{form_id}.svc", timeout=10)
@@ -259,147 +204,74 @@ def sync_form_raw(form_id, project_id):
         return
 
     for table_endpoint in tables:
-        if table_endpoint == "Submissions":
-            db_table_name = main_table_name
-        else:
-            clean_suffix = table_endpoint.replace("Submissions.", "").replace(".", "_").lower()
-            db_table_name = f"form_{base_name}_{clean_suffix}"
+        db_table_name = main_table_name if table_endpoint == "Submissions" else f"form_{base_name}_{table_endpoint.replace('Submissions.', '').replace('.', '_').lower()}"
 
-            # CRITICAL SELF-HEALING FIX: Drop legacy parent '_id' constraints on sub-tables 
-            # to clear out old unique violation blocks left behind by older code versions.
-            try:
-                with engine.begin() as conn:
-                    conn.execute(text(f'ALTER TABLE "{TARGET_SCHEMA}"."{db_table_name}" DROP CONSTRAINT IF EXISTS "idx_uq_{db_table_name}_id";'))
-                    conn.execute(text(f'DROP INDEX IF EXISTS "{TARGET_SCHEMA}"."idx_uq_{db_table_name}_id";'))
-            except Exception:
-                pass # Table or constraint might not exist yet, safe to proceed
-
-        # Isolate parameters for this endpoint loop and strip $filter for sub-tables.
+        # Strip $filter for sub-tables because ODK doesn't support __system queries on repeat groups
         current_params = base_params.copy()
         if table_endpoint != "Submissions" and "$filter" in current_params:
-            logger.debug(f"🧹 Scrubbing system metadata $filter parameter from sub-table query: {table_endpoint}")
             current_params.pop("$filter", None)
 
         total_written = 0
         for page_records in fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params=current_params):
-            if not page_records:
-                continue
+            if not page_records: continue
 
-            df = pd.json_normalize(page_records, sep='_')
-            df.columns = [col.replace('-', '_').replace('__', '_').lower().strip() for col in df.columns]
-
-            for col in df.columns:
-                if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                    df[col] = df[col].astype(str)
-
-            # Determine the primary conflict key based on table depth
-            if table_endpoint == "Submissions":
-                if "_id" in df.columns:
-                    conflict_key = "_id"
-                elif "__id" in df.columns:
-                    conflict_key = "__id"
-                elif "meta_instanceid" in df.columns:
-                    conflict_key = "meta_instanceid"
-                else:
-                    id_cols = [c for c in df.columns if c.endswith('_id')]
-                    conflict_key = id_cols[0] if id_cols else df.columns[0]
-            else:
-                # Relational sub-tables primary key strategy
-                if "_id" in df.columns:
-                    conflict_key = "_id"
-                elif "__id" in df.columns:
-                    conflict_key = "__id"
-                elif "customer_class_update_id" in df.columns:
-                    conflict_key = "customer_key"
-                elif "subid" in df.columns:
-                    conflict_key = "subid"
-                else:
-                    # Fallback to any ending with id that isn't the raw sequential 'id'
-                    non_meta_id_cols = [c for c in df.columns if c.endswith('id') and c != 'id']
-                    conflict_key = non_meta_id_cols[0] if non_meta_id_cols else df.columns[0]
-
-            # Safely deduplicate the DataFrame *before* SQL insertion to prevent transient duplicates
-            if conflict_key in df.columns:
-                df = df.drop_duplicates(subset=[conflict_key], keep='last')
-
-            count = upsert_raw_data(df, db_table_name, conflict_key=conflict_key)
-            total_written += count
+            # PURE EXTRACTION: Convert to 4-column schema without touching the JSON
+            df = parse_pure_raw(page_records)
+            df = df.drop_duplicates(subset=['_id'], keep='last')
+            
+            total_written += upsert_raw_data(df, db_table_name)
 
         if total_written > 0:
-            logger.info(f"✅ Securely committed {total_written} records to {TARGET_SCHEMA}.{db_table_name}")
+            logger.info(f"✅ Securely committed {total_written} raw records to {TARGET_SCHEMA}.{db_table_name}")
 
 def sync_dataset_raw(dataset_name, project_id):
     base_name = dataset_name.replace(' ', '_').lower()
     if base_name == "customers_db": base_name = "customer_db"
     db_table_name = f"entity_{base_name}"
     
-    last_update = get_smart_master_clock(dataset_name, is_form=False)
+    last_update = get_smart_master_clock(db_table_name)
     
     params = {}
     if last_update:
-        try:
-            buffer_time = pd.to_datetime(last_update) - pd.Timedelta(minutes=5)
-            last_update_buffered = buffer_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-            params = {"$filter": f"__system/updatedAt gt {last_update_buffered}"}
-            logger.info(f"📡 Requesting dataset deltas with 5-minute rolling safety buffer: {params['$filter']}")
-        except Exception as e:
-            params = {"$filter": f"__system/updatedAt gt {last_update}"}
+        buffer_time = pd.to_datetime(last_update) - pd.Timedelta(minutes=5)
+        last_update_buffered = buffer_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        params = {"$filter": f"__system/updatedAt gt {last_update_buffered}"}
+        logger.info(f"📡 Dataset delta requested: {params['$filter']}")
     else:
-        logger.info(f"📡 Requesting full baseline dataset download.")
+        logger.info(f"📡 Full baseline dataset download.")
     
     total_written = 0
     for page_records in fetch_entities_paginated(project_id, dataset_name, params=params):
-        if not page_records:
-            continue
+        if not page_records: continue
             
-        df = pd.json_normalize(page_records, sep='_')
-
-        cleaned_cols = []
-        for col in df.columns:
-            new_col = col.replace('properties_', '')
-            new_col = new_col.replace('-', '_').lower().strip()
-            cleaned_cols.append(new_col)
-        df.columns = cleaned_cols
-
-        if last_update and '__system_updatedat' in df.columns:
-            df = df[df['__system_updatedat'] > last_update]
-            
-        if df.empty:
-            continue
+        # PURE EXTRACTION: Convert to 4-column schema without touching the JSON
+        df = parse_pure_raw(page_records)
+        df = df.drop_duplicates(subset=['_id'], keep='last')
         
-        for col in df.columns:
-            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                df[col] = df[col].astype(str)
-                
-        count = upsert_raw_data(df, db_table_name, conflict_key="__id")
-        total_written += count
+        total_written += upsert_raw_data(df, db_table_name)
         
     if total_written > 0:
-        logger.info(f"✅ Securely committed {total_written} new/updated records to {TARGET_SCHEMA}.{db_table_name}")
-    else:
-        logger.info(f"⏸️ No delta updates found for dataset '{dataset_name}'.")
+        logger.info(f"✅ Securely committed {total_written} raw entity records to {TARGET_SCHEMA}.{db_table_name}")
 
 if __name__ == "__main__":
     try:
-        logger.info("🎬 [Phase 1/3] Initializing High-Performance Paginated Extractor...")
+        logger.info("🎬 [Phase 1/3] Initializing Pure Raw Data Extractor...")
         
-        # 1. Relational Form Sync Pipeline (Extracts comprehensive structural repeat groups safely)
-        logger.info("--- STARTING FORM EXTRACTION (RELATIONAL REPEATS) ---")
+        logger.info("--- STARTING FORM EXTRACTION ---")
         for form in discover_forms(PROJECT_ID):
             try:
                 sync_form_raw(form, PROJECT_ID)
             except Exception as e:
-                logger.error(f"❌ Synchronization failed for Form '{form}': {e}", exc_info=True)
+                logger.error(f"❌ Sync failed for Form '{form}': {e}", exc_info=True)
         
-        # 2. Stateful Entity Dataset Sync Pipeline
         logger.info("--- STARTING DATASET EXTRACTION ---")
         for dataset in discover_datasets(PROJECT_ID):
             try:
                 sync_dataset_raw(dataset, PROJECT_ID)
             except Exception as e:
-                logger.error(f"❌ Synchronization failed for Dataset '{dataset}': {e}", exc_info=True)
+                logger.error(f"❌ Sync failed for Dataset '{dataset}': {e}", exc_info=True)
                 
-        logger.info("🏁 [Phase 1/3] Extraction Operations Completed. Handoff to Cleaner...")
+        logger.info("🏁 [Phase 1/3] Extraction Operations Completed.")
     except Exception as e:
         logger.critical(f"💥 [Phase 1/3] Ingestion engine halted: {e}", exc_info=True)
     finally:
