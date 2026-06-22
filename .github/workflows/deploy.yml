@@ -1,0 +1,40 @@
+name: Deploy to DigitalOcean Droplet
+
+# Trigger configuration: Defines WHAT events cause this pipeline to activate
+on:
+  push:
+    branches:
+      - main  # The script fires instantly whenever code is pushed or merged to 'main'
+
+jobs:
+  deploy:
+    # Tells GitHub to spin up a pristine, temporary Ubuntu Linux cloud instance 
+    # just to run these remote management commands for us.
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Use an open-source, verified Action to establish an encrypted SSH tunnel
+      - name: SSH into Droplet and Update Code
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          
+          # Step 2: The exact execution commands running natively inside your droplet shell
+          script: |
+            echo "🚚 Moving into your deployment folder..."
+            cd /opt/data_platform
+            
+            echo "📥 Fetching updates from GitHub..."
+            git pull origin main
+            
+            echo "🐍 Activating your isolated virtual environment..."
+            source venv/bin/activate
+            
+            echo "📦 Confirming all application dependencies are perfectly aligned..."
+            pip install --upgrade pip
+            pip install -r requirements.txt
+            
+            echo "✨ Deployment complete!"

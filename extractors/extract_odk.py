@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import sys
 import uuid
 import json
@@ -11,8 +12,11 @@ from pyodk.client import Client
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+env_path = BASE_DIR / "config" / ".env"
+
 # 1. Setup Environment and Configurations
-load_dotenv("/opt/data_platform/config/.env")
+load_dotenv(dotenv_path=env_path)
 TARGET_SCHEMA = "data_raw"
 
 logging.basicConfig(
@@ -32,7 +36,7 @@ def validate_config():
 
 PROJECT_ID, DB_URL = validate_config()
 engine = create_engine(DB_URL, pool_pre_ping=True)
-client = Client(config_path="/opt/data_platform/config/.pyodk_config.toml")
+client = Client(config_path=BASE_DIR / "config" / ".pyodk_config.toml")
 
 retry_db = retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=50),
                 retry=retry_if_exception_type((DBAPIError, OperationalError)), reraise=True)
@@ -107,7 +111,7 @@ def fetch_form_submissions_paginated(project_id, form_id, table_endpoint, params
         current_params['$skip'] = skip
         
         logger.info(f"📡 Downloading Form ({form_id}) chunk for '{table_endpoint}': records {skip} to {skip+top}...")
-        response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=120, params=current_params)
+        response = client.get(f"projects/{project_id}/forms/{form_id}.svc/{table_endpoint}", timeout=1000, params=current_params)
         response.raise_for_status()
         
         data = response.json().get('value', [])
